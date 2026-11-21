@@ -1684,3 +1684,29 @@ html[data-motion="off"] #intro *, html[data-motion="off"] #intro { animation-dur
 .ink-canvas { display: block; width: 100%; cursor: crosshair; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
 .ink-canvas.erasing { cursor: cell; }
 @media print { .ink-bar, .on-ink-open { display: none; } }
+
+/* ================= v18: sign-in keeps your lectures (cloud backup) ================= */
+.sync-line { display: inline-flex; align-items: center; gap: 8px; font-size: .86rem; color: var(--muted); min-height: 1.2em; }
+.sync-line i { width: 8px; height: 8px; border-radius: 50%; background: #9ca3af; flex: none; }
+.sync-line[data-sync="ok"] i { background: #1f9d55; }
+.sync-line[data-sync="syncing"] i { background: var(--accent); animation: syncPulse 1s ease-in-out infinite; }
+.sync-line[data-sync="offline"] i { background: #d4820f; }
+.sync-line[data-sync="error"] i { background: #d64545; }
+.sync-line[data-sync="error"] { color: #d64545; }
+.sync-line[data-sync="off"] { display: none; }
+.sync-line.on-hero { margin-top: 8px; }
+@keyframes syncPulse { 50% { opacity: .35; transform: scale(.7); } }
+.acct-sync { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 14px; }
+.acct-note { margin: 10px 0 0; font-size: .82rem; line-height: 1.6; color: var(--muted); }
+.signin-banner { display: flex; align-items: center; gap: 14px; width: 100%; margin: 0 0 18px; padding: 14px 16px; text-align: left; cursor: pointer;
+  border-radius: 20px; border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); color: inherit; font: inherit;
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface)); }
+.signin-banner .grow { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.signin-banner .grow span { font-size: .86rem; color: var(--muted); line-height: 1.5; }
+.signin-banner .sb-ico { width: 40px; height: 40px; border-radius: 14px; display: grid; place-items: center; flex: none; color: #fff; background: var(--accent); }
+.signin-banner svg { width: 20px; height: 20px; flex: none; }
+@media (prefers-reduced-motion: reduce) { .sync-line[data-sync="syncing"] i { animation: none; } }
+
+.ask-points { list-style: none; margin: 10px 0 16px; padding: 0; display: grid; gap: 8px; font-size: .9rem; }
+.ask-points li { display: flex; align-items: center; gap: 10px; }
+.ask-points svg { width: 18px; height: 18px; flex: none; color: var(--accent); }

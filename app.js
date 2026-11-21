@@ -10,6 +10,7 @@ import { buildFreeNotes, fillTranslations, buildQuiz } from './free-notes.js';
 import { playSound, SOUND_STYLES } from './sounds.js';
 import { parseDue, buildICS, googleCalendarUrl } from './calendar.js';
 import * as Account from './account.js';
+import * as Cloud from './cloud.js';
 import * as Tutor from './tutor.js';
 import { mindMapView, staticMindMapHTML, MM_NODE_CSS } from './mindmap.js';
 import { notesDocument, outlineBlocks, OUTLINE_CSS } from './export-doc.js';
@@ -500,7 +501,16 @@ async function recoverChunks(lec) {
   return true;
 }
 function cleanForSave(lec) { return { ...lec, segments: lec.segments.map(({ _pend, ...s }) => s) }; }
-async function saveLecture(lec) { lec.updated = Date.now(); await DB.put(cleanForSave(lec)); }
+// Whose lectures this device shows: with real sign-in, a lecture backed up to an account belongs to that account.
+const myUid = () => Cloud.user() || (Account.account() || {}).uid || null;
+const isMine = l => !Account.REAL_AUTH && !Cloud.user() ? true : !l.owner || l.owner === myUid();
+async function myLectures() { return (await DB.all()).filter(isMine); }
+async function saveLecture(lec) {
+  lec.updated = Date.now();
+  if (Cloud.user() && !lec.owner) lec.owner = Cloud.user();
+  await DB.put(cleanForSave(lec));
+  Cloud.queue(lec, { slow: !!(state.rec && state.rec.status !== 'idle' && state.lecture && state.lecture.id === lec.id) });
+}
 
 /* ================= app state & settings ================= */
 const state = {
@@ -668,7 +678,7 @@ async function speechVocab(lec) {
   if (lec.course) add(lec.course, 6);
   fromNotes(lec.notes, 4);
   try {
-    if (lec.course) (await DB.all()).filter(l => l.id !== lec.id && l.course === lec.course && l.notes).slice(0, 12).forEach(l => fromNotes(l.notes, 3));
+    if (lec.course) (await myLectures()).filter(l => l.id !== lec.id && l.course === lec.course && l.notes).slice(0, 12).forEach(l => fromNotes(l.notes, 3));
   } catch { /* first lecture */ }
   // English names and terms from the professor's slides: capitalised phrases, and words that keep coming up
   const slides = (lec.files || []).map(f => f.text || '').join('\n');
@@ -1397,7 +1407,7 @@ async function claudeNotes(lec, files, hasTranscript) {
   const content = [];
   let bytes = 0;
   for (const f of files) {
-    if (f.kind === 'pdf') {
+    if (f.kind === 'pdf' && f.blob) {
       bytes += f.size;
       content.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: await blobToB64(f.blob) }, title: f.name });
     } else if (f.kind === 'image') {
@@ -1553,7 +1563,7 @@ function signInButtons(onDone, { compact = false } = {}) {
     return b;
   };
   return h('div', { class: 'sso-stack' + (compact ? ' compact' : '') },
-    btn('apple', '用 Apple 登入'),
+    Account.REAL_AUTH ? null : btn('apple', '用 Apple 登入'), // Apple sign-in needs a paid Apple developer account; not set up on the Firebase project
     btn('google', '用 Google 登入'));
 }
 
@@ -1699,10 +1709,15 @@ function showIntro() {
     ['tutor', '複習時', '不懂的直接問助教', '助教讀過整堂課，回答會標出時間，點一下就能跳回去重聽那一段。'],
     ['smart', '不用訂閱', '想更聰明，就接上 API', '所有功能都免費。之後在設定貼上自己的金鑰，筆記和字幕會變得更準。'],
   ];
+  const firstTime = !Store.get('onboarded', false);
   const close = () => {
     Store.set('onboarded', true);
     root.classList.add('leaving');
-    setTimeout(() => { root.remove(); document.documentElement.classList.remove('intro-open'); }, motionOn() ? 420 : 0);
+    setTimeout(() => {
+      root.remove(); document.documentElement.classList.remove('intro-open');
+      // First visit only: once the tour is over, offer sign-in so the lectures follow the account.
+      if (firstTime && Account.REAL_AUTH && !Account.account()) askSignIn();
+    }, motionOn() ? 420 : 0);
   };
   const scroller = h('div', { class: 'in-scroll', tabindex: '0' }, STEPS.map(([k, eyebrow, title, text], i) =>
     h('section', { class: 'in-step in-' + k + '-step', 'data-i': String(i) },
@@ -1749,31 +1764,59 @@ function confirmSheet({ icon: ic, color = '#ef4f6b', title, text, ok, danger = f
   });
 }
 async function doSignOut() {
-  if (!(await confirmSheet({ icon: 'log-out', color: '#6b7280', title: '要登出嗎？', text: '你的課堂和筆記都還在這台裝置上，不會被刪除。', ok: '登出' }))) return;
+  if (!(await confirmSheet({ icon: 'log-out', color: '#6b7280', title: '要登出嗎？', text: '已備份到帳號的課堂會從這台裝置的列表收起來，下次用同一個帳號登入就會回來。', ok: '登出' }))) return;
+  Cloud.flush();
   await Account.signOut();
+  Cloud.setUser(null);
   toast('已登出', { icon: 'log-out' });
   render();
 }
 async function doDeleteAccount() {
   if (!(await confirmSheet({
     icon: 'trash-2', title: '刪除帳號？', danger: true, ok: '永久刪除帳號',
-    text: '會刪除你的帳號和用量紀錄，無法復原。這台裝置上的課堂和筆記不會被刪除。',
+    text: '會刪除你的帳號，以及備份在雲端的所有課堂和筆記，無法復原。',
   }))) return;
-  try { await Account.deleteAccount(); } catch (e) { toast(e.message || '刪除失敗', { icon: 'info', ms: 5000 }); return; }
+  try { await Account.deleteAccount(() => Cloud.wipe()); Cloud.setUser(null); } catch (e) { toast(e.message || '刪除失敗', { icon: 'info', ms: 5000 }); return; }
   toast('帳號已刪除', { icon: 'check' });
   render();
+}
+const syncText = st => st.state === 'syncing' ? '同步中…' : st.state === 'ok' ? '已備份到你的帳號 · ' + new Date(st.at).toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' })
+  : st.state === 'offline' ? '離線中，連上網路後會自動同步' : st.state === 'error' ? st.error : '';
+function syncLine(cls = '') {
+  const st = Cloud.status();
+  return h('span', { class: 'sync-line ' + cls, 'data-sync': st.state }, h('i'), h('span', null, syncText(st)));
+}
+Cloud.onStatus(st => document.querySelectorAll('.sync-line').forEach(el => { el.dataset.sync = st.state; el.lastElementChild.textContent = syncText(st); }));
+// Shown once, right after the first-run tour. Signing in is optional.
+function askSignIn() {
+  let dlg;
+  dlg = openDialog([
+    h('div', { class: 'cal-head' }, h('span', { class: 'sticker', style: '--sz:46px;--r:-8deg;--a:#8b5cf6;--b:#8b5cf6;animation:none' }, icon('cloud')),
+      h('div', null, h('h3', { style: 'margin:0' }, '要登入嗎？'))),
+    h('p', { class: 'muted', style: 'margin:12px 0 4px;line-height:1.6' }, '登入後，每堂課的逐字稿、筆記和手寫會備份到你的帳號。下週回來複習或換一台裝置，登入同一個帳號就看得到。'),
+    h('ul', { class: 'ask-points' },
+      h('li', null, icon('shield-check'), '只有你自己讀得到自己的課堂'),
+      h('li', null, icon('headphones'), '錄音檔不會上傳，只留在這台裝置'),
+      h('li', null, icon('check'), '不登入也能用，資料就只存在這台裝置')),
+    signInButtons(() => { dlg.closeDialog(); render(); }, { compact: true }),
+    h('button', { class: 'btn ghost block', style: 'margin-top:8px', onclick: () => dlg.closeDialog() }, '先不用'),
+    h('p', { class: 'muted small', style: 'text-align:center;margin:10px 0 0' }, '之後隨時可以到「設定」登入。'),
+  ], { cls: 'sheet' });
 }
 function accountCard() {
   const a = Account.account();
   if (!a) {
     return h('div', { class: 'acct-card guest' },
       h('div', { class: 'acct-top' }, avatar(null, 54),
-        h('div', { class: 'grow' }, h('b', null, '尚未登入'), h('span', null, '登入後會顯示你的帳號。課堂和筆記仍存在這台裝置。'))),
+        h('div', { class: 'grow' }, h('b', null, '尚未登入'), h('span', null, '登入後，每堂課的逐字稿、筆記和手寫都會備份到你的帳號。換裝置或下週回來複習，登入同一個帳號就看得到。'))),
       signInButtons(() => render(), { compact: true }));
   }
   return h('div', { class: 'acct-card' },
     h('div', { class: 'acct-top' }, avatar(a, 54),
       h('div', { class: 'grow' }, h('b', null, a.name), h('span', null, a.email))),
+    h('div', { class: 'acct-sync' }, syncLine(),
+      h('button', { class: 'btn sm', onclick: async e => { const b = e.currentTarget; b.disabled = true; await Cloud.sync(); b.disabled = false; } }, icon('refresh-cw'), '立即同步')),
+    h('p', { class: 'acct-note' }, '會備份：逐字稿、筆記、測驗、手寫、講義文字。錄音檔和講義原始檔太大，只留在錄音的那台裝置。'),
     h('div', { class: 'acct-actions' },
       h('button', { class: 'btn sm ghost', onclick: doSignOut }, icon('log-out'), '登出')),
     h('button', { class: 'acct-delete', onclick: doDeleteAccount }, '刪除帳號'));
@@ -1783,7 +1826,7 @@ function accountCard() {
 const app = () => $('#app');
 
 async function renderHome() {
-  const list = (await DB.all()).sort((a, b) => b.created - a.created);
+  const list = (await myLectures()).sort((a, b) => b.created - a.created);
   const cfg = settings();
   const hr = new Date().getHours();
   const greet = hr < 5 ? '夜深了' : hr < 11 ? '早安' : hr < 14 ? '午安' : hr < 18 ? '午後好' : '晚安';
@@ -1802,7 +1845,8 @@ async function renderHome() {
       h('section', { class: 'hero' },
         h('div', { class: 'hero-art', 'aria-hidden': 'true' }, sticker('notebook-pen'), sticker('mic'), sticker('sparkles')),
         h('div', { class: 'hero-top' },
-          h('div', null, h('h1', null, `${greet}，準備好上課了嗎？`), h('div', { class: 'sub' }, fmtDate(Date.now())))),
+          h('div', null, h('h1', null, `${greet}，準備好上課了嗎？`), h('div', { class: 'sub' }, fmtDate(Date.now())),
+            Account.REAL_AUTH && Account.account() ? syncLine('on-hero') : null)),
         h('div', { class: 'stats' },
           h('div', { class: 'stat' }, h('b', null, String(list.length)), h('span', null, '堂課')),
           h('div', { class: 'stat' }, h('b', null, totalMs ? fmtDuration(totalMs) : '0'), h('span', null, '錄音時間')),
@@ -1811,6 +1855,10 @@ async function renderHome() {
           h('button', { class: 'btn primary lg', onclick: newLectureDialog }, icon('mic'), '新的一堂課'),
           list.length > 3 ? h('label', { class: 'search' }, icon('book-open'),
             h('input', { type: 'search', placeholder: '搜尋課程或標題', value: state.search, oninput: e => { state.search = e.target.value; renderList(); } })) : null)),
+      Account.REAL_AUTH && !Account.account() ? h('button', { class: 'signin-banner', onclick: () => go('#/settings') },
+        h('span', { class: 'sb-ico' }, icon('cloud')),
+        h('span', { class: 'grow' }, h('b', null, '登入，課堂紀錄就不會不見'), h('span', null, '用 Google 登入後，筆記會跟著你的帳號，下次登入就看得到。')),
+        icon('chevron-right')) : null,
       listBox));
   app().replaceChildren(root);
   function renderList() {
@@ -1830,7 +1878,7 @@ async function renderHome() {
           l.notes ? h('span', { class: 'chip ok' }, icon('sparkles'), l.notes.engine === 'claude' ? 'AI 筆記' : '筆記') : h('span', { class: 'chip' }, '尚無筆記'),
           l.segments && l.segments.length ? h('span', { class: 'chip' }, icon('captions'), '逐字稿') : null,
           l.files && l.files.length ? h('span', { class: 'chip' }, icon('paperclip'), String(l.files.length)) : null,
-          l.audioParts && l.audioParts.length ? h('span', { class: 'chip' }, icon('headphones'), '錄音') : null)))))) :
+          l.audioParts && l.audioParts.length ? h('span', { class: 'chip' }, icon('headphones'), '錄音') : l.hasAudio ? h('span', { class: 'chip', title: '錄音檔留在錄音的那台裝置' }, icon('headphones'), '錄音在另一台裝置') : null)))))) :
       [h('div', { class: 'empty' },
         h('div', { class: 'wave-art' }, h('i'), h('i'), h('i'), h('i'), h('i'), h('i'), h('i')),
         h('h3', null, q ? '找不到符合的課' : '還沒有任何一堂課'),
@@ -1841,7 +1889,7 @@ async function renderHome() {
 }
 
 function newLectureDialog() {
-  DB.all().then(list => {
+  myLectures().then(list => {
     const courses = [...new Set(list.map(l => l.course).filter(Boolean))];
     const d = new Date();
     let dlg;
@@ -2428,7 +2476,7 @@ async function tutorContext(lec) {
   const blocks = [];
   let bytes = 0;
   for (const f of lec.files || []) {
-    if (f.kind === 'pdf' && bytes + f.size < 22 * 1024 * 1024) {
+    if (f.kind === 'pdf' && f.blob && bytes + f.size < 22 * 1024 * 1024) {
       bytes += f.size;
       blocks.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: await blobToB64(f.blob) }, title: f.name });
     } else if (f.kind === 'image' && bytes + f.size < 22 * 1024 * 1024) {
@@ -3227,6 +3275,8 @@ function renderFilesPane() {
     })));
 }
 function filePreview(f) {
+  if (!f.blob) return h('pre', { class: 'file-preview', style: 'white-space:pre-wrap;height:auto;max-height:60vh;overflow:auto;font-size:.85rem;padding:14px;background:var(--surface)' },
+    '這份講義的原始檔留在上傳它的那台裝置，這裡只有讀出來的文字。\n\n' + (f.text || '（沒有可顯示的文字）').slice(0, 20000));
   const url = URL.createObjectURL(f.blob);
   if (f.kind === 'pdf') return h('iframe', { class: 'file-preview', src: url, title: f.name });
   if (f.kind === 'image') return h('img', { class: 'file-preview img', src: url, alt: f.name });
@@ -3246,7 +3296,7 @@ function lectureMenu() {
       item('trash-2', '刪除這堂課', async () => {
         if (state.rec) { toast('請先結束錄音', { icon: 'info' }); return; }
         if (!confirm('確定刪除這堂課？錄音、逐字稿、講義和筆記都會一起刪除，無法復原。')) return;
-        await DB.del(lec.id); go('#/');
+        await DB.del(lec.id); Cloud.remove(lec.id, lec); go('#/');
       }, 'danger')),
     h('div', { class: 'row' }, h('button', { class: 'btn ghost', onclick: () => dlg.closeDialog() }, '關閉')),
   ], { cls: 'sheet' });
@@ -3348,7 +3398,8 @@ async function renderSettings() {
       group('教學',
         row('book-open', '#8b5cf6', '重看使用教學', '第一次打開時看到的滑動教學', h('button', { class: 'btn sm', onclick: () => showIntro() }, '播放'))),
       group('隱私與儲存',
-        row('shield-check', '#1f9d55', '資料只存在這台裝置', '錄音、逐字稿、講義、筆記和金鑰都不會上傳到這個網站，也不會同步到其他裝置。'),
+        Account.REAL_AUTH ? row('shield-check', '#1f9d55', '資料存在哪裡', '沒登入時，所有資料只存在這台裝置。登入後，逐字稿、筆記和手寫會備份到你的帳號（Google Firebase），只有你自己讀得到。錄音檔和 API 金鑰永遠只留在這台裝置。')
+          : row('shield-check', '#1f9d55', '資料只存在這台裝置', '錄音、逐字稿、講義、筆記和金鑰都不會上傳到這個網站，也不會同步到其他裝置。'),
         h('div', { class: 'row-item col' },
           h('div', { class: 'ri-head' }, h('span', { class: 'ri-ico', style: '--c:#6b7280' }, icon('cpu')), h('div', { class: 'ri-text' }, h('b', null, '儲存空間'), h('span', null, usageTxt || '無法讀取'))),
           h('div', { class: 'meter' }, h('i', { style: `width:${usagePct}%` })))),
@@ -3441,7 +3492,16 @@ async function render() {
   else await renderHome();
 }
 window.addEventListener('hashchange', route);
-Account.watchAccount(() => { if (!document.querySelector('dialog[open]')) render(); });
+const refreshAfterSync = () => { if (state.view !== 'lecture' && !document.querySelector('dialog[open]') && !document.querySelector('#intro')) render(); };
+Cloud.init({ all: () => DB.all(), get: id => DB.get(id), put: o => DB.put(o), del: id => DB.del(id),
+  isOpen: id => !!(state.lecture && state.lecture.id === id), onChange: refreshAfterSync });
+Account.watchAccount(() => { if (!document.querySelector('dialog[open]')) render(); }, uid => Cloud.setUser(uid));
+let lastCloudCheck = Date.now();
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) Cloud.flush();
+  else if (Cloud.user() && Date.now() - lastCloudCheck > 120000) { lastCloudCheck = Date.now(); Cloud.sync(); }
+});
+window.addEventListener('online', () => { if (Cloud.user()) Cloud.sync(); });
 let wasWide = matchMedia('(min-width: 900px)').matches;
 window.addEventListener('resize', () => {
   const wide = matchMedia('(min-width: 900px)').matches;
@@ -3465,7 +3525,7 @@ applyAppearance();
 renderJellyBlobs();
 renderDoodles();
 setupRefraction();
-window.__lectureNotes = { state, Recorder, outlinePDF, BrowserSTT, MicCapture, LocalAI, render, buildFreeNotes, player, renderPlayer, bloom, calendarSheet, notesDocHTML, shareSheet, speechVocab };
+window.__lectureNotes = { Cloud, Account, DB, state, Recorder, outlinePDF, BrowserSTT, MicCapture, LocalAI, render, buildFreeNotes, player, renderPlayer, bloom, calendarSheet, notesDocHTML, shareSheet, speechVocab };
 // Launch animation lives in index.html so it shows on the very first frame; take it away once it has played.
 const splash = document.getElementById('splash');
 const splashMs = splash && getComputedStyle(splash).display !== 'none' && motionOn() ? 2050 : 0;

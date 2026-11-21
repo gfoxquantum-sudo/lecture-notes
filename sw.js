@@ -1,6 +1,6 @@
 // Offline cache: app shell + CDN libraries, so saved notes open without internet.
-const CACHE = 'lecture-notes-v17';
-const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'icons.js', 'free-notes.js', 'sounds.js', 'calendar.js', 'account.js', 'firebase-config.js', 'tutor.js', 'mindmap.js', 'export-doc.js', 'ink.js', 'pcm-worklet.js', 'manifest.webmanifest', 'icon.svg', 'icon-180.png', 'icon-192.png'];
+const CACHE = 'lecture-notes-v18';
+const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'icons.js', 'free-notes.js', 'sounds.js', 'calendar.js', 'account.js', 'cloud.js', 'firebase-config.js', 'tutor.js', 'mindmap.js', 'export-doc.js', 'ink.js', 'pcm-worklet.js', 'manifest.webmanifest', 'icon.svg', 'icon-180.png', 'icon-192.png'];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
 });

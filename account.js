@@ -1,5 +1,5 @@
-// Accounts and subscriptions.
-// Preview build: sign-in and purchases are simulated on this device so the screens can be tried.
+// Accounts. Real sign-in (Google / Apple) runs on Firebase once firebase-config.js is filled in;
+// until then sign-in is simulated on this device so the screens can be tried.
 // Later: signIn → Firebase Auth (Sign in with Apple / Google), subscribe/restore → StoreKit 2 in the iPhone app,
 // with the server checking the receipt and counting hours. Only the functions in this file need to change.
 
@@ -44,7 +44,7 @@ function firebase() {
     ]);
     const a = auth.getAuth(initializeApp(FIREBASE));
     a.useDeviceLanguage();
-    return { auth, a };
+    return { auth, a, app: a.app };
   })().catch(e => { fb = null; throw e; });
   return fb;
 }
@@ -64,13 +64,15 @@ const authError = e => {
   return '登入失敗（' + (c || (e && e.message) || e) + '）';
 };
 // Keep the saved account in step with Firebase (signed out elsewhere, name changed…). Calls back when it changes.
-export async function watchAccount(onChange) {
+export async function firebaseApp() { return (await firebase()).app; }
+export async function watchAccount(onChange, onUser) {
   if (!REAL_AUTH) return;
   try {
     const { auth, a } = await firebase();
     auth.onAuthStateChanged(a, u => {
       const before = JSON.stringify(get('account', null));
       set('account', u ? fromUser(u) : null);
+      if (onUser) onUser(u ? u.uid : null);
       if (JSON.stringify(get('account', null)) !== before && onChange) onChange();
     });
   } catch (e) { console.warn('sign-in service unavailable', e); }
@@ -99,8 +101,9 @@ export async function signOut() {
   if (REAL_AUTH) { try { const { auth, a } = await firebase(); await auth.signOut(a); } catch (e) { console.warn(e); } }
   set('account', null);
 }
-export async function deleteAccount() {
+export async function deleteAccount(beforeDelete) {
   if (REAL_AUTH) {
+    if (beforeDelete) await beforeDelete();
     const { auth, a } = await firebase();
     const u = a.currentUser;
     if (u) {
