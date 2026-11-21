@@ -105,10 +105,15 @@ export function buildFreeNotes({ sentencesIn, slidesText, title, professorId, fm
     const heads = kws.filter(w => !usedHeads.has(w)).slice(0, 2);
     heads.forEach(w => usedHeads.add(w));
     const pts = topIn(c, Math.min(6, Math.max(3, Math.round(c.length / 5))));
+    const picked = new Set(pts.map(s => s.idx));
+    const inChunk = new Map(c.map(s => [s.idx, s]));
+    const follow = s => { const nx = inChunk.get(s.idx + 1); return nx && !picked.has(nx.idx) && nx.text.length >= 8 && !/[？?]$/.test(nx.text) ? side(clip(nx.text, 200)) : { zh: '', en: '' }; };
+    const gist = [...c].sort((a, b) => b.score - a.score)[0];
     return {
       heading: side(heads.join('・') || clip(pts[0] ? pts[0].text : '內容', 14)),
       time: fmtTime(c[0].t),
-      points: pts.map(s => ({ text: side(clip(s.text, 160)), emphasis: !!emphasisOf(s.text), source: 'lecture' })),
+      summary: gist && !picked.has(gist.idx) ? side(clip(gist.text, 90)) : { zh: '', en: '' },   // never repeat a point as the gist
+      points: pts.map(s => ({ text: side(clip(s.text, 160)), detail: follow(s), emphasis: !!emphasisOf(s.text), source: 'lecture' })),
       _kws: kws.slice(0, 8),
       _chunk: c,
     };
@@ -271,7 +276,7 @@ export function buildFreeNotes({ sentencesIn, slidesText, title, professorId, fm
   const opening = key_terms.find(t => t.term_zh && t._at <= openingEnd);
   const autoTitle = opening ? opening.term_zh : outline[0] ? (outline[0].heading.zh || outline[0].heading.en) : (globalKw[0] || '課堂筆記');
   for (const t of key_terms) delete t._at;
-  return {
+  const notes = {
     title: opening && !title ? { zh: opening.term_zh, en: opening.term_en } : side(title || autoTitle),
     one_line: one ? side(clip(one.text, 120)) : side('（內容太少，無法整理）'),
     overview: top.length ? joinSide(top.slice(0, 3)) : side(slideLines.slice(0, 3).join('；') || '（沒有足夠的內容）'),
@@ -279,7 +284,7 @@ export function buildFreeNotes({ sentencesIn, slidesText, title, professorId, fm
     learning_objectives: key_terms.length >= 2
       ? key_terms.slice(0, 5).map(t => ({ zh: t.term_zh ? `理解「${t.term_zh}」${t.term_en ? '（' + t.term_en + '）' : ''}` : (zhLecture ? `理解「${t.term_en}」` : ''), en: t.term_en ? `Understand ${t.term_en}` : '' }))
       : globalKw.slice(0, 4).map(w => (/[一-鿿]/.test(w) ? { zh: `理解「${w}」`, en: '' } : { zh: '', en: `Understand "${w}"` })),
-    outline: outline.map(({ heading, time, points }) => ({ heading, time, points })),
+    outline: outline.map(({ heading, time, summary, points }) => ({ heading, time, summary: summary || { zh: '', en: '' }, points })),
     mind_map: { center: opening && !title ? { zh: opening.term_zh, en: opening.term_en } : side(title || autoTitle), branches },
     key_terms,
     tables: [],
@@ -289,9 +294,74 @@ export function buildFreeNotes({ sentencesIn, slidesText, title, professorId, fm
     todo,
     summary: top.length ? joinSide(top) : side(''),
   };
+  notes.quiz = buildQuiz(notes);
+  return notes;
 }
 
 // Walks every {zh, en} pair in the notes and fills the empty side with translate().
+// Multiple-choice and fill-in-the-blank questions made from finished notes (also used for notes saved before quizzes existed).
+// Kept from being trivial: choices are told apart by their descriptions, and blanks are cut out of the professor's own key sentences.
+export function buildQuiz(n) {
+  const terms = (n.key_terms || []).map(t => ({ name: t.term_zh || t.term_en, alt: t.term_zh && t.term_en ? t.term_en : '', def: t.definition || {}, t }))
+    .filter(x => x.name && (x.def.zh || x.def.en));
+  const defText = x => x.def.zh || x.def.en;
+  const CUE = /(會考|必考|很重要|要記得|記得|一定要|注意|important|exam|remember)/i;
+  // The description on its own: no term names (they would give the answer away) and no "this will be on the exam" asides.
+  const bare = (text, x) => {
+    let t = text;
+    for (const y of terms) for (const w of [y.t.term_zh, y.t.term_en].filter(Boolean)) if (y === x || t.startsWith(w)) t = t.split(w).join(y === x ? '' : w);
+    t = t.replace(/[（(]\s*[）)]/g, '').replace(/^[\s，,、:：]*(是指|指的是|就是|是|means|is|refers to)\s*/i, '');
+    const parts = t.split(/(?<=[，,；;])/);
+    while (parts.length > 1 && CUE.test(parts[parts.length - 1])) parts.pop();
+    return parts.join('').replace(/[，,；;。.\s]+$/, '');
+  };
+  const sideOf = (d, x) => ({ zh: d.zh ? bare(d.zh, x) : '', en: d.en ? bare(d.en, x) : '' });
+  const pick = (list, k, seed) => { const a = list.slice(); const out = []; let r = seed * 7 + 3; while (a.length && out.length < k) { r = (r * 31 + 17) % 997; out.push(a.splice(r % a.length, 1)[0]); } return out; };
+  const place = (right, wrong, seed) => { const opts = wrong.slice(); const at = (seed * 5 + 1) % (wrong.length + 1); opts.splice(at, 0, right); return { opts, at }; };
+  const choice = [], blank = [];
+
+  // Only sentences that really define something make fair options ("X 是指…"), not ones that merely mention the term.
+  const defining = x => /(是指|指的是|就是|定義|means|refers to|is defined)/i.test(defText(x));
+  terms.filter(defining).forEach((x, i) => {
+    const others = terms.filter(y => y !== x && defining(y) && defText(y) !== defText(x));
+    if (others.length < 2 || choice.length >= 6) return;
+    const wrong = pick(others, 3, i);
+    const zh = !!(x.def.zh || x.t.term_zh);
+    if (i % 2 === 0) {     // which statement is true of X?
+      const { opts, at } = place(sideOf(x.def, x), wrong.map(y => sideOf(y.def, y)), i);
+      choice.push({ type: 'choice', question: zh ? { zh: `關於「${x.name}」${x.alt ? '（' + x.alt + '）' : ''}，下列哪一個敘述正確？`, en: '' } : { zh: '', en: `Which statement about "${x.name}" is correct?` },
+        options: opts, answer_index: at,
+        answer: { zh: '', en: '' }, explanation: x.def });
+    } else {               // which term does this describe?
+      const { opts, at } = place(x, wrong, i);
+      const d = bare(defText(x), x);
+      choice.push({ type: 'choice', question: zh ? { zh: `教授的這段說明是在講哪一個概念？「${d}」`, en: '' } : { zh: '', en: `Which concept is being described? "${d}"` },
+        options: opts.map(y => ({ zh: y.t.term_zh || '', en: y.t.term_en || '' })), answer_index: at,
+        answer: { zh: '', en: '' }, explanation: x.def });
+    }
+  });
+
+  const sentences = [...(n.exam_focus || []).map(e => e.point), ...(n.outline || []).flatMap(o => (o.points || []).filter(p => p.emphasis).map(p => p.text)),
+    ...(n.outline || []).flatMap(o => (o.points || []).slice(0, 2).map(p => p.text))];
+  const used = new Set();
+  for (const sen of sentences) {
+    if (blank.length >= 6) break;
+    const txt = (sen && (sen.zh || sen.en)) || '';
+    if (txt.length < 10 || used.has(txt)) continue;
+    const hit = terms.map(x => [x, [x.t.term_zh, x.t.term_en].filter(Boolean).find(w => txt.includes(w))]).find(([x, w]) => w && !used.has(x.name));
+    if (!hit) continue;
+    const [x, w] = hit;
+    used.add(txt); used.add(x.name);
+    const cut = txt.replace(w, '＿＿＿＿').replace(/＿＿＿＿\s*[（(][^）)]*[）)]/, '＿＿＿＿');
+    if (cut.replace(/[＿\s，。,.]/g, '').length < 8) continue;
+    blank.push({ type: 'blank', question: sen.zh ? { zh: cut, en: '' } : { zh: '', en: cut }, options: [], answer_index: -1,
+      answer: { zh: x.t.term_zh || '', en: x.t.term_en || '' }, explanation: x.def });
+  }
+  const out = [];
+  for (let i = 0; i < Math.max(choice.length, blank.length); i++) { if (choice[i]) out.push(choice[i]); if (blank[i]) out.push(blank[i]); }
+  return out.slice(0, 10);
+}
+
 export async function fillTranslations(notes, translate, onProgress) {
   const pairs = [];
   const walk = o => {

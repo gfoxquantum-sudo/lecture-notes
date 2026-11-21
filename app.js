@@ -6,13 +6,14 @@
 // and are only sent to Soniox (speech) and Anthropic (notes).
 
 import { ICONS } from './icons.js';
-import { buildFreeNotes, fillTranslations } from './free-notes.js';
+import { buildFreeNotes, fillTranslations, buildQuiz } from './free-notes.js';
 import { playSound, SOUND_STYLES } from './sounds.js';
 import { parseDue, buildICS, googleCalendarUrl } from './calendar.js';
 import * as Account from './account.js';
 import * as Tutor from './tutor.js';
 import { mindMapView, staticMindMapHTML, MM_NODE_CSS } from './mindmap.js';
-import { notesDocument } from './export-doc.js';
+import { notesDocument, outlineBlocks, OUTLINE_CSS } from './export-doc.js';
+import { inkPad, inkImage, hasInk } from './ink.js';
 
 const SDK_URL = 'https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@1.3.0/+esm';
 const OPENCC_URL = 'https://cdn.jsdelivr.net/npm/opencc-js@1.4.2/dist/esm/cn2t.js';
@@ -515,7 +516,7 @@ const state = {
   search: '',
 };
 const settings = () => ({
-  plan: Store.get('plan', null),
+  plan: (Store.get('sonioxKey', '') || Store.get('anthropicKey', '')) ? 'pro' : 'free',
   sonioxKey: Store.get('sonioxKey', ''),
   anthropicKey: Store.get('anthropicKey', ''),
   translate: Store.get('translate', true),
@@ -617,6 +618,24 @@ class MicCapture {
         this.recorder.start(5000);
       } catch { this.recorder = null; }
     }
+  }
+  // The lecturer is usually metres away. This copy of the microphone cuts the low rumble (air-con, desks),
+  // lifts quiet speech and evens out the volume, so the built-in recogniser hears the front of the room better.
+  boostedTrack() {
+    if (this.boost) return this.boost;
+    try {
+      const c = this.ctx;
+      const hp = c.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 110; hp.Q.value = .7;
+      const presence = c.createBiquadFilter(); presence.type = 'peaking'; presence.frequency.value = 2600; presence.Q.value = .9; presence.gain.value = 4;
+      const comp = c.createDynamicsCompressor(); comp.threshold.value = -42; comp.knee.value = 24; comp.ratio.value = 5; comp.attack.value = .004; comp.release.value = .22;
+      const gain = c.createGain(); gain.gain.value = 3.2;
+      const limit = c.createDynamicsCompressor(); limit.threshold.value = -3; limit.knee.value = 0; limit.ratio.value = 20; limit.attack.value = .001; limit.release.value = .08;
+      const out = c.createMediaStreamDestination();
+      this.src.connect(hp); hp.connect(presence); presence.connect(comp); comp.connect(gain); gain.connect(limit); limit.connect(out);
+      this.boostNodes = [hp, presence, comp, gain, limit, out];
+      this.boost = out.stream.getAudioTracks()[0] || null;
+    } catch { this.boost = null; }
+    return this.boost;
   }
   pause() { this.paused = true; try { this.recorder && this.recorder.state === 'recording' && this.recorder.pause(); } catch { /* ignore */ } }
   resume() { this.paused = false; try { this.recorder && this.recorder.state === 'paused' && this.recorder.resume(); } catch { /* ignore */ } }
@@ -723,33 +742,133 @@ class SonioxSession {
 }
 
 /* ================= Browser speech recognition (free) ================= */
+// Small edit distance, for fixing a slightly mis-heard English term ("elasticty" → "elasticity").
+function editDistance(a, b, max) {
+  if (Math.abs(a.length - b.length) > max) return max + 1;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i]; let low = i;
+    for (let j = 1; j <= b.length; j++) { cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)); if (cur[j] < low) low = cur[j]; }
+    if (low > max) return max + 1;
+    prev = cur;
+  }
+  return prev[b.length];
+}
 class BrowserSTT {
-  constructor({ lang, onFinal, onInterim, onError }) {
-    Object.assign(this, { lang, onFinal, onInterim, onError });
+  // vocab: course name, terms from the slides and earlier lectures. track(): the boosted microphone, when there is one.
+  constructor({ lang, onFinal, onInterim, onError, vocab = [], track = null }) {
+    Object.assign(this, { lang, onFinal, onInterim, onError, track });
     this.SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    this.vocab = vocab.filter(v => v && v.length >= 2).slice(0, 80);
+    this.vocabLc = this.vocab.map(v => v.toLowerCase());
+    this.words = this.vocab.filter(v => /^[A-Za-z][A-Za-z-]{5,}$/.test(v));   // single English terms worth correcting towards
+    this.wordSet = new Set(this.words.map(w => w.toLowerCase()));
   }
   static supported() { return !!(window.SpeechRecognition || window.webkitSpeechRecognition); }
+  // The recogniser offers several guesses. Prefer the one that contains words we expect in this course.
+  best(res) {
+    let pick = res[0], top = -1;
+    for (let i = 0; i < res.length; i++) {
+      const t = res[i].transcript.toLowerCase();
+      let hits = 0;
+      for (const v of this.vocabLc) if (t.includes(v)) hits += v.length >= 4 ? 2 : 1;
+      const score = hits * 1.5 + (res[i].confidence || 0) - i * .05;
+      if (score > top) { top = score; pick = res[i]; }
+    }
+    return this.fix(pick.transcript);
+  }
+  fix(text) {
+    if (!this.words.length) return text;
+    return text.replace(/[A-Za-z][A-Za-z-]{4,}/g, w => {
+      const lc = w.toLowerCase();
+      if (this.wordSet.has(lc)) return w;
+      for (const term of this.words) {
+        const max = term.length >= 9 ? 2 : 1;
+        if (lc[0] === term[0].toLowerCase() && editDistance(lc, term.toLowerCase(), max) <= max) return term;
+      }
+      return w;
+    });
+  }
+  begin(r) {
+    const t = this.track && !this.noTrack ? this.track() : null;
+    this.usingTrack = !!(t && t.readyState === 'live');
+    try { this.usingTrack ? r.start(t) : r.start(); }
+    catch { this.usingTrack = false; try { r.start(); } catch { /* already started */ } }
+  }
   start() {
     this.active = true;
     const r = new this.SR();
     r.lang = this.lang; r.continuous = true; r.interimResults = true;
+    try { r.maxAlternatives = 5; } catch { /* older browsers */ }
+    if (this.vocab.length && !this.noPhrases && 'phrases' in r && window.SpeechRecognitionPhrase) {
+      try { r.phrases = this.vocab.slice(0, 60).map(v => new SpeechRecognitionPhrase(v, 4)); } catch { this.noPhrases = true; }
+    }
     r.onresult = e => {
       let interim = '';
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const res = e.results[i];
-        if (res.isFinal) this.onFinal(res[0].transcript);
+        if (res.isFinal) this.onFinal(this.best(res));
         else interim += res[0].transcript;
       }
+      this.got = true;
       this.onInterim(interim);
     };
-    r.onerror = e => { if (e.error !== 'no-speech' && e.error !== 'aborted') this.onError(e.error); };
-    r.onend = () => { if (this.active) { try { r.start(); } catch { /* ignore */ } } };
+    r.onerror = e => {
+      if (e.error === 'no-speech' || e.error === 'aborted') return;
+      // An extra this browser can't do: quietly switch it off and carry on.
+      if (e.error === 'phrases-not-supported' && !this.noPhrases) { this.noPhrases = true; this.swap = true; return; }
+      if (this.usingTrack && !this.got && (e.error === 'audio-capture' || e.error === 'network' || e.error === 'service-not-allowed')) { this.noTrack = true; this.swap = true; return; }
+      this.onError(e.error);
+    };
+    r.onend = () => {
+      if (!this.active) return;
+      if (this.swap) { this.swap = false; this.start(); return; }
+      this.begin(r);
+    };
     this.r = r;
-    r.start();
+    this.begin(r);
   }
   pause() { this.active = false; try { this.r.stop(); } catch { /* ignore */ } }
   resume() { this.start(); }
   stop() { this.active = false; try { this.r.stop(); } catch { /* ignore */ } }
+}
+
+// The browser's own on-device AI (Gemini Nano in Chrome), when this device has it: free, private, no key.
+const LocalAI = {
+  opts: null,
+  async status() {
+    if (!('LanguageModel' in self)) return 'unavailable';
+    for (const o of [{ expectedInputs: [{ type: 'text', languages: ['zh', 'en'] }], expectedOutputs: [{ type: 'text', languages: ['zh'] }] }, {}]) {
+      try { const a = await LanguageModel.availability(o); if (a && a !== 'unavailable') { this.opts = o; return a; } } catch { /* try the next form */ }
+    }
+    return 'unavailable';
+  },
+  async ready() { return Store.get('localAI', true) && (await this.status()) === 'available'; },
+  async download(onProgress) {
+    await this.status();
+    const s = await LanguageModel.create({ ...(this.opts || {}), monitor(m) { m.addEventListener('downloadprogress', e => onProgress && onProgress(e.loaded)); } });
+    s.destroy();
+  },
+  async ask(system, prompt, onText) {
+    const s = await LanguageModel.create({ ...(this.opts || {}), initialPrompts: [{ role: 'system', content: system }] });
+    try {
+      let out = '';
+      for await (const chunk of s.promptStreaming(prompt)) { out = out && chunk.startsWith(out) ? chunk : out + chunk; onText && onText(out); }
+      return out.trim();
+    } finally { try { s.destroy(); } catch { /* ignore */ } }
+  },
+};
+// The on-device model reads only a little at a time, so it gets the passages that match the question, not the whole lecture.
+async function localTutor(lec, q, onText) {
+  const qt = new Set(Tutor.tokens(q));
+  const segs = lec.segments.filter(s => s.text.trim()).map(s => ({ s, text: segText(s), hit: Tutor.tokens(segText(s)).filter(t => qt.has(t)).length }));
+  const top = segs.filter(x => x.hit).sort((a, b) => b.hit - a.hit).slice(0, 10);
+  const use = (top.length ? top : segs.slice(-8)).sort((a, b) => a.s.start - b.s.start);
+  let ctx = use.map(x => `[${fmtTime(x.s.start)}] ${x.text}`).join('\n').slice(0, 3200);
+  const n = lec.notes;
+  if (n) ctx += '\n\n筆記摘要：' + [(n.one_line || {}).zh, (n.summary || {}).zh].filter(Boolean).join(' ').slice(0, 500);
+  return LocalAI.ask('你是這門課的助教。只根據提供的逐字稿片段回答，用繁體中文，簡短清楚（最多五句）。引用內容時在句尾附上原本的時間標記，例如 [12:48]。片段裡沒有的事不要編造，直接說這堂課沒有提到。',
+    `逐字稿片段：\n${ctx}\n\n學生的問題：${q}`, onText);
 }
 
 /* ================= Recorder controller ================= */
@@ -834,9 +953,8 @@ class Recorder {
     this.mode = proReady().stt ? 'soniox' : 'free';
     if (this.mode === 'soniox' && !(await ensureAIConsent())) this.mode = 'free';
     if (this.mode === 'free' && !BrowserSTT.supported()) {
-      toast('這個瀏覽器沒有內建語音辨識，請改用 Chrome 或 Safari，或改用進階版', { icon: 'info', ms: 5000 }); return;
+      toast('這個瀏覽器沒有內建語音辨識，請改用 Chrome 或 Safari，或到設定接上 Soniox', { icon: 'info', ms: 5000 }); return;
     }
-    if (cfg.plan === 'pro' && !cfg.sonioxKey) toast('還沒填 Soniox 金鑰，先用免費辨識', { icon: 'info', ms: 4000 });
     try {
       const est = await navigator.storage.estimate();
       if (est.quota - est.usage < 300 * 1024 * 1024) toast('裝置空間不多了，長時間錄音可能存不下', { icon: 'info', ms: 5000 });
@@ -861,8 +979,10 @@ class Recorder {
         });
         await this.session.start();
       } else {
+        const vocab = (await speechVocab(this.lec).catch(() => null) || {}).terms || [];
         this.browser = new BrowserSTT({
-          lang: cfg.mainLang === 'en' ? 'en-US' : 'zh-TW',
+          lang: cfg.mainLang === 'en' ? 'en-US' : 'zh-TW', vocab,
+          track: Store.get('farField', true) ? () => this.mic && this.mic.boostedTrack() : null,
           onFinal: text => this.addFreeSegment(text),
           onInterim: text => { this.nonFinal = { text, tr: '' }; scheduleRender(); },
           onError: err => toast('語音辨識：' + (err === 'not-allowed' ? '請允許使用麥克風' : err), { icon: 'info' }),
@@ -1160,13 +1280,14 @@ const NOTES_SCHEMA = obj({
   title: B, one_line: B, overview: B,
   professor_speaker: { type: 'string' },
   learning_objectives: arr(B),
-  outline: arr(obj({ heading: B, time: { type: 'string' }, points: arr(obj({ text: B, emphasis: { type: 'boolean' }, source: { type: 'string', enum: ['lecture', 'slides', 'both'] } })) })),
+  outline: arr(obj({ heading: B, time: { type: 'string' }, summary: B, points: arr(obj({ text: B, detail: B, emphasis: { type: 'boolean' }, source: { type: 'string', enum: ['lecture', 'slides', 'both'] } })) })),
   mind_map: obj({ center: B, branches: arr(obj({ label: B, children: arr(obj({ label: B, leaves: arr(B) })) })) }),
   key_terms: arr(obj({ term_en: { type: 'string' }, term_zh: { type: 'string' }, definition: B })),
   tables: arr(obj({ title: B, columns: arr(B), rows: arr(obj({ cells: arr(B) })) })),
   exam_focus: arr(obj({ point: B, why: B, time: { type: 'string' } })),
   class_qa: arr(obj({ question: B, answer: B, asked_by: { type: 'string' } })),
   review_questions: arr(obj({ question: B, answer: B })),
+  quiz: arr(obj({ type: { type: 'string', enum: ['choice', 'blank'] }, question: B, options: arr(B), answer_index: { type: 'integer' }, answer: B, explanation: B })),
   todo: arr(B),
   summary: B,
 });
@@ -1179,11 +1300,17 @@ const SYSTEM_PROMPT = `你是一位頂尖的大學助教，專門把課堂錄音
 - 講義（投影片、PDF）用來校正逐字稿的辨識錯誤、補足公式與專有名詞，但不要把講義上教授沒講到的內容當成重點；講義才有的內容 source 標 "slides"。
 - 逐字稿有辨識錯誤是正常的，依上下文與講義判斷正確的詞。
 - outline 依照上課的時間順序分段，time 用逐字稿的時間標記（mm:ss 或 h:mm:ss），沒有就給空字串。長時間的課（超過 1 小時）大約每 10–15 分鐘一段，3–4 小時的課可以有 15 段以上。每段 3–8 個要點，要點寫成完整、可獨立理解的句子，不要只寫關鍵字。
+- outline 同時是「大綱」也是「筆記」，要寫到學生只看這一頁就能複習：每段的 summary 用一句話說這段在講什麼、結論是什麼；每個要點的 detail 是筆記內容——補上教授的解釋、原因、推導步驟、舉的例子或數字（1–3 句），讓要點不只是一句結論。教授沒有多做說明的要點，detail 給空字串，不要硬湊。
 - emphasis = true 只用在教授明確強調的內容（例如「這很重要」「考試會考」「大家要記得」、重複講好幾次的觀念）。
 - exam_focus 收錄最可能考的觀念，why 說明判斷依據（例如教授說了什麼）。
 - mind_map：center 是本堂課主題，3–7 個 branches，每個 branch 2–5 個 children，leaves 是簡短關鍵詞（每個 child 0–4 個）。標籤要短（中文 12 字以內）。
 - tables：只在內容真的適合比較時才做表格（例如方法比較、優缺點、分類），每個表格 2–5 欄；沒有適合的就給空陣列。
 - review_questions：5–10 題康乃爾筆記式的自我測驗問題，附簡潔答案。
+- quiz：8–12 題正式測驗，選擇題（type "choice"）和填充題（type "blank"）大約各半，難度是「期中考會出的題目」，不要送分題：
+  · 要考理解、比較、因果、應用與推論（例如給一個新情境問結果、問兩個概念的差別、問為什麼），不要只是照抄定義或問「什麼是 X」。
+  · 選擇題：options 剛好 4 個，只有一個正確；錯誤選項要像真的（學生常見的誤解、相近但不同的概念、因果顛倒），長度和語氣跟正確選項相近，不要出現「以上皆是／皆非」。answer_index 是正確選項的位置（0–3），正確答案的位置要分散。answer 填正確選項的文字。
+  · 填充題：question 是一個完整的句子，把最關鍵的一個概念、名詞或數值挖空，用「＿＿＿＿」表示（中英文版本都要挖）；挖掉的必須是需要理解才填得出來的詞，不能從句子其他部分直接看出來。options 給空陣列，answer_index 填 -1，answer 是標準答案（簡短，中英文都給）。
+  · explanation：一到兩句話說明為什麼是這個答案，以及最容易錯在哪裡。
 - professor_speaker：判斷哪個說話者編號是教授，填入編號字串；無法判斷就填空字串。
 - todo：作業、報告、考試日期、教授交代要準備的事；沒有就給空陣列。
 - 不要編造逐字稿和講義裡沒有的事實。`;
@@ -1347,7 +1474,7 @@ async function translateTranscript() {
         if (++n % 10 === 0) { toast(`翻譯中… ${n}/${todo.length}`, { icon: 'languages', ms: 60000 }); rerenderTranscript(); }
       }
       await saveLecture(lec); rerenderTranscript();
-    } else throw new Error('這個裝置沒有免費翻譯可用，請改用電腦版 Chrome 或進階版');
+    } else throw new Error('這個裝置沒有免費翻譯可用，請改用電腦版 Chrome，或到設定接上 API');
     toast('翻譯完成', { icon: 'languages' });
   } catch (err) {
     toast('翻譯失敗：' + (err.message || err), { icon: 'info', ms: 6000 });
@@ -1369,8 +1496,8 @@ function segSides(s) {
 }
 function planBadge() {
   const pro = isPro();
-  return h('button', { class: 'badge ' + (pro ? 'pro' : 'free'), onclick: () => showPlans(), title: '比較方案' },
-    icon(pro ? 'crown' : 'gift'), pro ? '進階版' : '免費版');
+  return h('button', { class: 'badge ' + (pro ? 'pro' : 'free'), onclick: () => showPlans(), title: pro ? '已連上 AI' : '怎麼讓它更聰明？' },
+    icon('sparkles'), pro ? 'AI 加強中' : '讓它更聰明');
 }
 
 /* ================= consent before anything goes to an outside AI service ================= */
@@ -1383,12 +1510,12 @@ function ensureAIConsent() {
       h('span', { class: 'ri-ico', style: `--c:${color}` }, icon(ic)), h('div', { class: 'ri-text' }, h('b', null, title), h('span', null, text)));
     dlg = openDialog([
       h('div', { class: 'cal-head' }, h('span', { class: 'sticker', style: '--sz:46px;--r:-8deg;animation:none' }, icon('shield-check')),
-        h('div', null, h('h3', { style: 'margin:0' }, '進階版會用到外部 AI 服務'), h('div', { class: 'muted small' }, '開始之前，請先確認你同意以下資料傳送'))),
+        h('div', null, h('h3', { style: 'margin:0' }, '接上 API 會用到外部 AI 服務'), h('div', { class: 'muted small' }, '開始之前，請先確認你同意以下資料傳送'))),
       h('div', { style: 'margin-top:12px' },
         item('audio-lines', '#5b5ce2', 'Soniox（語音辨識）', '錄音會即時傳給 Soniox，轉成逐字稿和翻譯。'),
         item('sparkles', '#d4820f', 'Anthropic（Claude）', '整理筆記或補翻譯時，會把逐字稿和你上傳的講義傳給 Claude。'),
         item('lock', '#1f9d55', '其他資料留在你的裝置', '課堂和筆記都存在這台裝置，只有處理當下需要的內容會傳出去；這兩家公司依各自的隱私政策處理收到的資料。')),
-      h('p', { class: 'muted small', style: 'margin:10px 0 0' }, '不同意的話，可以繼續使用免費版：' + (NATIVE ? '語音辨識在 iPhone 上進行，' : '') + '筆記在裝置上自動整理，不會傳給 AI 公司。'),
+      h('p', { class: 'muted small', style: 'margin:10px 0 0' }, '不同意的話，可以繼續用裝置上的功能：' + (NATIVE ? '語音辨識在 iPhone 上進行，' : '') + '筆記在裝置上自動整理，不會傳給 AI 公司。'),
       h('div', { class: 'cal-actions' },
         h('button', { class: 'btn primary lg block', onclick: () => done(true) }, icon('check'), '我同意，繼續'),
         h('button', { class: 'btn ghost block', onclick: () => done(false) }, '不同意')),
@@ -1405,6 +1532,7 @@ const brandIcon = k => { const t = document.createElement('template'); t.innerHT
 const ntd = n => 'NT$' + n.toLocaleString('en-US');
 function avatar(a, size = 36) {
   return h('span', { class: 'avatar ' + (a ? a.provider : 'guest'), style: `--sz:${size}px` },
+    a && a.photo ? h('img', { class: 'av-photo', src: a.photo, alt: '', referrerpolicy: 'no-referrer', onerror: e => e.target.remove() }) : null,
     a ? (a.name || '?').trim().charAt(0).toUpperCase() : icon('user-round'),
     a ? h('span', { class: 'av-badge' }, brandIcon(a.provider)) : null);
 }
@@ -1417,8 +1545,7 @@ function signInButtons(onDone, { compact = false } = {}) {
       try {
         const a = await Account.signIn(provider);
         buzz('success');
-        if (Store.get('plan', null) !== 'pro' && Account.subscription()) Store.set('plan', 'pro');
-        toast(`已登入：${a.name}` + (Account.PREVIEW ? '（預覽模擬）' : ''), { icon: 'check' });
+        toast(`已登入：${a.name}` + (Account.REAL_AUTH ? '' : '（預覽模擬）'), { icon: 'check' });
         onDone && onDone(a);
       } catch (e) { toast(e.message || '登入失敗', { icon: 'info' }); }
       finally { b.classList.remove('busy'); b.disabled = false; }
@@ -1436,150 +1563,174 @@ function legalLinks() {
     h('a', { href: '#', onclick: e => { e.preventDefault(); toast('隱私權政策頁面會在上架前補上', { icon: 'info' }); } }, '隱私權政策'));
 }
 
-function showPlans({ first = false, step } = {}) {
-  let cur = step || (first ? 'welcome' : 'plans');
-  let billing = 'monthly';
-  let afterSignIn = null;
-  const body = h('div', { class: 'ob-body' });
-  const dots = h('div', { class: 'ob-dots' }, ['welcome', 'signin', 'plans'].map(s => h('i', { 'data-s': s })));
+// "How do I make it smarter?" — there are no plans to buy: pasting your own API key is what upgrades it.
+function showPlans() {
+  const cfg = settings();
   let dlg;
-  const finish = () => {
-    Store.set('onboarded', true);
-    if (!Store.get('plan', null)) Store.set('plan', 'free');
-    dlg.closeDialog();
-  };
-  const show = (s, dir = 1) => {
-    cur = s;
-    dots.querySelectorAll('i').forEach(i => i.classList.toggle('on', i.dataset.s === s));
-    dots.hidden = !first;
-    body.replaceChildren(VIEWS[s]());
-    body.scrollTop = 0; dlg && (dlg.scrollTop = 0);
-    if (body.firstChild) jellyIn(body.firstChild, dir > 0 ? 'below' : 'above');
-    afterRender();
-  };
-
-  const VIEWS = {
-    welcome: () => h('div', { class: 'ob-step welcome' },
-      h('div', { class: 'ob-art', 'aria-hidden': 'true' },
-        h('span', { class: 'ob-glow' }),
-        sticker('notebook-pen', '--sz:86px;--r:-6deg'),
-        sticker('mic', '--sz:50px;--r:12deg;--a:#f5a524;--b:#ef4f6b;--dl:-1.2s'),
-        sticker('languages', '--sz:44px;--r:-14deg;--a:#5b8def;--b:#8b5cf6;--dl:-2.4s'),
-        sticker('sparkles', '--sz:40px;--r:10deg;--a:#14b8a6;--b:#22a3c4;--dl:-3.6s')),
-      h('h2', null, '上課，只要專心聽'),
-      h('p', { class: 'ob-sub' }, '錄音、即時字幕、中英對照筆記，蛤說啥幫你一次整理好。'),
-      h('div', { class: 'ob-feats' },
-        [['captions', '#17946f', '即時字幕', '教授說什麼，馬上看得到'],
-          ['list-tree', '#d4820f', '有條理的筆記', '大綱、考點、心智圖、表格'],
-          ['users', '#5b5ce2', '分辨講者', '教授和同學的發言分開']].map(([ic, c, t, d], j) =>
-          h('div', { class: 'ob-feat', style: `--j:${j}` }, h('span', { class: 'ri-ico', style: `--c:${c}` }, icon(ic)), h('div', null, h('b', null, t), h('span', null, d))))),
-      h('div', { class: 'ob-actions' },
-        h('button', { class: 'btn primary lg block', onclick: () => show(Account.account() ? 'plans' : 'signin') }, '開始使用', icon('chevron-right')))),
-
-    signin: () => {
-      const a = Account.account();
-      return h('div', { class: 'ob-step signin' },
-        !first ? h('button', { class: 'btn icon ghost ob-back', 'aria-label': '返回', onclick: () => show('plans', -1) }, icon('chevron-left')) : null,
-        h('div', { class: 'ob-art small', 'aria-hidden': 'true' }, h('span', { class: 'ob-glow' }), avatar(a, 78)),
-        h('h2', null, afterSignIn ? '先登入，才能訂閱' : '登入蛤說啥'),
-        h('p', { class: 'ob-sub' }, afterSignIn ? '訂閱會綁在你的帳號上，換手機、重新安裝都能恢復。' : '登入後可以訂閱進階版，之後換裝置也能恢復方案。'),
-        signInButtons(() => { const next = afterSignIn; afterSignIn = null; show('plans'); if (next) setTimeout(next, 450); }),
-        h('div', { class: 'ob-or' }, h('span', null, '或')),
-        h('button', { class: 'btn ghost block', onclick: () => { afterSignIn = null; first ? show('plans') : show('plans', -1); } },
-          first ? '先不登入，用免費版看看' : '先不要'),
-        h('p', { class: 'muted small ob-note' }, icon('lock'), ' 只用來辨識你的帳號，不會讀取信件或聯絡人。', Account.PREVIEW ? ' 預覽版會模擬登入。' : ''),
-        legalLinks());
-    },
-
-    plans: () => {
-      const a = Account.account();
-      const sub = Account.subscription();
-      const plan = Store.get('plan', null);
-      const P = Account.PRODUCTS;
-      const feat = (yes, text, j) => h('li', { class: yes ? 'yes' : 'no', style: `--j:${j}` }, h('span', { class: 'ck' }, icon(yes ? 'check' : 'x')), h('span', null, text));
-      const priceBox = h('div', { class: 'price-box' });
-      const proBtn = h('button', { class: 'btn primary lg block buy' });
-      const paint = () => {
-        const p = P[billing];
-        priceBox.replaceChildren(
-          h('div', { class: 'price' }, h('span', { class: 'amt', key: billing }, ntd(p.price)), h('small', null, '／' + p.per)),
-          h('div', { class: 'price-sub' }, billing === 'yearly' ? `平均每月 ${ntd(p.perMonth)}，比月繳省 ${Account.yearlySaving()}%` : '按月付款，隨時可以取消'));
-        const amt = priceBox.querySelector('.amt'); amt && jelly(amt, .6, 520);
-        proBtn.replaceChildren(
-          sub ? h('span', null, '目前方案') : h('span', null, a ? `訂閱 ${p.label}方案` : '登入並訂閱'),
-          h('span', { class: 'sso-spin' }), sub ? null : icon('chevron-right'));
-        proBtn.disabled = !!sub;
-      };
-      proBtn.onclick = async () => {
-        if (proBtn.classList.contains('busy')) return;
-        if (!Account.account()) { afterSignIn = () => body.querySelector('.buy')?.click(); show('signin'); return; }
-        if (!(await ensureAIConsent())) { toast('沒有同意資料傳送，維持免費版', { icon: 'gift' }); return; }
-        proBtn.classList.add('busy'); proBtn.disabled = true;
-        try {
-          await Account.subscribe(billing);
-          Store.set('plan', 'pro');
-          Store.set('onboarded', true);
-          buzz('success'); sfx('done');
-          dlg.closeDialog();
-          setTimeout(() => { bloom(); toast('歡迎加入進階版' + (Account.PREVIEW ? '（預覽模擬，沒有扣款）' : ''), { icon: 'crown', ms: 3600 }); render(); }, 260);
-        } catch (e) { toast(e.message || '訂閱沒有完成', { icon: 'info' }); proBtn.classList.remove('busy'); proBtn.disabled = false; }
-      };
-      const bill = seg([{ v: 'monthly', label: '月繳' }, { v: 'yearly', label: `年繳 省${Account.yearlySaving()}%` }], billing,
-        v => { billing = v; Store.set('billing', v); paint(); }, 'seg full billing accent');
-      paint();
-      return h('div', { class: 'ob-step plans-step' },
-        h('div', { class: 'plans-hero' },
-          h('h2', null, first ? '選一個適合你的方案' : '方案與訂閱'),
-          h('p', null, '兩種方案都能錄音、看即時字幕、整理筆記。之後隨時可以升級或取消。')),
-        h('div', { class: 'bill-wrap' }, bill),
-        h('div', { class: 'plan-grid' },
-          h('div', { class: 'plan' + (plan !== 'pro' && Store.get('onboarded', false) ? ' selected' : ''), style: '--i:0' },
-            h('h3', null, icon('gift'), '免費版'),
-            h('div', { class: 'price-box' }, h('div', { class: 'price' }, 'NT$0', h('small', null, '永久免費')), h('div', { class: 'price-sub' }, '不用登入，打開就能用')),
-            h('ul', { class: 'feat' },
-              feat(true, NATIVE ? '即時字幕（iPhone 內建語音辨識）' : '即時字幕（瀏覽器內建語音辨識）', 0),
-              feat(true, '自動整理：大綱、考試重點、名詞表、心智圖、自我測驗', 1),
-              feat(true, '上傳講義（PDF／PPT／Word）一起整理', 2),
-              feat(true, '錄音回放、加入行事曆', 3),
-              feat(false, '分辨教授和同學的聲音', 4),
-              feat(false, '中英混講辨識和即時翻譯', 5),
-              feat(false, 'Claude AI 改寫的中英對照筆記', 6)),
-            h('button', { class: 'btn lg block' + (plan !== 'pro' ? ' soft' : ''), onclick: () => {
-              if (sub) { toast('要取消訂閱，請到「設定 > 帳號 > 管理訂閱」', { icon: 'info', ms: 4000 }); return; }
-              Store.set('plan', 'free'); buzz('medium'); finish(); toast('使用免費版', { icon: 'gift' }); render();
-            } }, plan !== 'pro' && Store.get('onboarded', false) ? '目前方案' : '使用免費版')),
-          h('div', { class: 'plan pro' + (plan === 'pro' ? ' selected' : ''), style: '--i:1' },
-            h('span', { class: 'ribbon badge pro' }, icon('crown'), '推薦'),
-            h('h3', null, icon('sparkles'), '進階版'),
-            priceBox,
-            h('ul', { class: 'feat' },
-              feat(true, `每月 ${P[billing].hours} 小時中英混講即時字幕＋翻譯`, 0),
-              feat(true, '自動分辨教授和同學的聲音', 1),
-              feat(true, 'Claude 讀完講義和逐字稿，寫出中英對照筆記', 2),
-              feat(true, '比較表格、課堂問答、考點依據更準確', 3),
-              feat(true, '不用自己申請金鑰，登入就能用', 4),
-              feat(true, '包含免費版的所有功能', 5)),
-            proBtn)),
-        h('div', { class: 'plans-foot' },
-          h('p', null, `進階版為自動續訂的訂閱，${ntd(P.monthly.price)}／月或 ${ntd(P.yearly.price)}／年，從你的 Apple ID 扣款。除非在目前期間結束前至少 24 小時取消，否則會自動續訂。可隨時在 iPhone「設定 > Apple ID > 訂閱」管理或取消。`),
-          h('div', { class: 'foot-links' },
-            h('a', { href: '#', onclick: async e => {
-              e.preventDefault();
-              if (!Account.account()) { toast('請先登入，才能恢復購買', { icon: 'info' }); show('signin'); return; }
-              const s = await Account.restore();
-              if (s) { Store.set('plan', 'pro'); toast('已恢復進階版', { icon: 'crown' }); show('plans'); render(); } else toast('這個帳號沒有找到訂閱紀錄', { icon: 'info' });
-            } }, '恢復購買'), ' · ',
-            !a ? h('a', { href: '#', onclick: e => { e.preventDefault(); show('signin'); } }, '登入') : h('span', { class: 'who' }, avatar(a, 18), a.name), ' · ',
-            legalLinks())));
-    },
-  };
-
+  const li = (ic, title, text, tag) => h('li', null, h('span', { class: 'fa-ico' }, icon(ic)), h('div', null, h('b', null, title, tag || null), h('span', null, text)));
+  const on = k => (cfg[k] ? h('span', { class: 'status-dot on' }, icon('check'), '已接上') : null);
+  const localTag = h('span', { class: 'status-dot off' }, '檢查中…');
+  LocalAI.status().then(st => { localTag.className = 'status-dot ' + (st === 'available' ? 'on' : 'off'); localTag.textContent = st === 'available' ? '裝置 AI 可用' : st === 'unavailable' ? '這個瀏覽器沒有裝置 AI' : '裝置 AI 下載後可用'; });
   dlg = openDialog([
-    !first ? h('button', { class: 'btn icon ghost plans-close', 'aria-label': '關閉', onclick: () => dlg.closeDialog() }, icon('x')) : null,
-    dots, body,
-  ], { cls: 'plans onboard', onClose: () => { if (!Store.get('plan', null)) { Store.set('plan', 'free'); render(); } Store.set('onboarded', true); } });
-  show(cur);
+    h('button', { class: 'btn icon ghost plans-close', 'aria-label': '關閉', onclick: () => dlg.closeDialog() }, icon('x')),
+    h('div', { class: 'cal-head' }, h('span', { class: 'sticker', style: '--sz:46px;--r:-8deg;animation:none' }, icon('sparkles')),
+      h('div', null, h('h3', { style: 'margin:0' }, '哪些免費，哪些要接 API'), h('div', { class: 'muted small' }, '沒有訂閱。能在裝置上做的都免費，只有真的做不到的才交給 API。'))),
+    h('div', { class: 'fa-box free' },
+      h('div', { class: 'fa-title' }, icon('gift'), '免費，打開就能用'),
+      h('ul', { class: 'fa-list' },
+        li('mic', '錄音與重聽', '長時間錄音、點逐字稿跳回那一段、錄到一半當掉也救得回來'),
+        li('captions', '即時字幕', '瀏覽器內建辨識，加上收音加強和講義詞彙校正；一次一種主要語言'),
+        li('languages', '中英翻譯', '用瀏覽器內建翻譯（電腦版 Chrome）'),
+        li('list-tree', '筆記、心智圖、名詞表', '從逐字稿挑出重點句、考點和名詞自動整理'),
+        li('brain', '選擇題＋填充題測驗', '用名詞定義和教授強調的句子出題'),
+        li('sparkles', '「我恍神了」', '挑出最近幾分鐘的關鍵句和教授的提醒'),
+        li('message-circle', '助教問答', '裝置上的 AI 直接回答；沒有的話幫你找出相關片段', localTag),
+        li('share', '匯出與分享', 'GoodNotes／PDF、Markdown、行事曆、分享錄音'))),
+    h('div', { class: 'fa-box api' },
+      h('div', { class: 'fa-title' }, icon('zap'), '接上 API 才做得到'),
+      h('ul', { class: 'fa-list' },
+        li('users', '分辨教授和同學', '需要 Soniox：知道每一句是誰說的', on('sonioxKey')),
+        li('captions', '中英混講也聽得懂', '需要 Soniox：同一句裡中英文夾雜、口音和專有名詞更準', on('sonioxKey')),
+        li('languages', '每句同步翻譯（所有瀏覽器）', '需要 Soniox：手機和 Safari 也有逐句翻譯', on('sonioxKey')),
+        li('list-tree', '真正讀懂整堂課的筆記', '需要 Claude：重新組織內容、補上因果和比較表格，不是只挑句子', on('anthropicKey')),
+        li('brain', '期中考等級的測驗', '需要 Claude：考應用和推論，錯誤選項像真的誤解', on('anthropicKey')),
+        li('message-circle', '讀過整堂課和講義的助教', '需要 Claude：能跨段落整理、解釋沒聽懂的觀念', on('anthropicKey')))),
+    h('p', { class: 'muted small', style: 'margin:12px 0 0' }, icon('lock'), ' 金鑰只存在這台裝置。API 的費用由 Anthropic／Soniox 依用量直接向你收取。'),
+    h('div', { class: 'cal-actions' },
+      h('button', { class: 'btn primary lg block', onclick: () => { dlg.closeDialog(); go('#/settings'); setTimeout(() => document.querySelector('.key-field')?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 500); } }, icon('zap'), cfg.anthropicKey && cfg.sonioxKey ? '管理金鑰' : '去貼上金鑰'),
+      h('button', { class: 'btn ghost block', onclick: () => dlg.closeDialog() }, '先用免費的就好')),
+  ], { cls: 'sheet smart-sheet' });
   return dlg;
+}
+
+/* ================= first-open tour: scroll down and each feature plays like a short film ================= */
+function showIntro() {
+  if (document.getElementById('intro')) return;
+  const typed = (cls, text) => h('span', { class: 'ty ' + cls, style: `--n:${[...text].length}` }, text);
+  const scene = {
+    hero: () => h('div', { class: 'in-demo in-hero' },
+      h('span', { class: 'in-orb' }, icon('audio-lines')),
+      sticker('mic', '--sz:54px;--r:12deg;--a:#f5a524;--b:#ef4f6b;--dl:-1.2s'),
+      sticker('languages', '--sz:48px;--r:-14deg;--a:#5b8def;--b:#8b5cf6;--dl:-2.4s'),
+      sticker('notebook-pen', '--sz:50px;--r:8deg;--a:#14b8a6;--b:#22a3c4;--dl:-3.6s')),
+    captions: () => h('div', { class: 'in-demo in-card' },
+      h('div', { class: 'in-bar' }, h('i', { class: 'in-rec' }), h('b', null, '錄音中'), h('span', { class: 'in-wave' }, Array.from({ length: 14 }, (_, i) => h('i', { style: `--i:${i}` }))), h('span', { class: 'in-time' }, '12:48')),
+      h('div', { class: 'in-cap', style: '--d:.3s' }, h('em', { class: 'prof' }, '教授'), typed('zh', '今天要講的是供給與需求的均衡'), h('small', null, 'Today we cover supply and demand equilibrium')),
+      h('div', { class: 'in-cap', style: '--d:1.9s' }, h('em', { class: 'prof' }, '教授'), typed('zh', '價格上升時，需求量會下降'), h('small', null, 'When price rises, quantity demanded falls')),
+      h('div', { class: 'in-cap', style: '--d:3.5s' }, h('em', null, '同學'), typed('zh', '老師，這個期中會考嗎？'), h('small', null, 'Will this be on the midterm?'))),
+    zoned: () => h('div', { class: 'in-demo in-card' },
+      h('div', { class: 'in-zone-btn' }, icon('sparkles'), '我恍神了'),
+      h('div', { class: 'in-pop' },
+        h('b', null, '最近 5 分鐘的重點'),
+        [['均衡價格是供給線和需求線的交點', '.9s'], ['教授提醒：圖一定要會畫', '1.5s'], ['新名詞：price elasticity 價格彈性', '2.1s']].map(([t, d]) => h('p', { style: `--d:${d}` }, h('i'), t)))),
+    notes: () => {
+      // A small working copy of the notes screen: the tabs switch, the mind map answers taps, the quiz can be answered.
+      const NODE = {
+        '供需均衡': '供給線和需求線的交點，市場在這個價格和數量停下來。',
+        '需求': '價格越高，想買的量越少——需求線往右下斜。',
+        '供給': '價格越高，願意賣的量越多——供給線往右上斜。',
+        '彈性': '價格變 1%，數量跟著變幾 %。大於 1 就是「有彈性」。',
+        '考點': '教授說：均衡的圖一定要會畫，彈性的計算必考。',
+      };
+      const tip = h('p', { class: 'in-tip' }, icon('sparkles'), h('span', null, '點一下任何一個圓圈看看'));
+      const svg = (() => { const t = document.createElement('template'); t.innerHTML = `<svg viewBox="0 0 320 170" class="in-mm" role="group" aria-label="心智圖範例">
+        <path d="M160 85 C120 85 110 40 74 40" /><path d="M160 85 C120 85 110 130 74 130" /><path d="M160 85 C200 85 210 40 246 40" /><path d="M160 85 C200 85 210 130 246 130" />
+        <g class="c" tabindex="0" role="button" data-k="供需均衡"><rect x="112" y="67" width="96" height="36" rx="18"/><text x="160" y="90">供需均衡</text></g>
+        <g class="n" tabindex="0" role="button" data-k="需求" style="--d:.9s;--c:#f5a524"><rect x="14" y="24" width="64" height="32" rx="16"/><text x="46" y="45">需求</text></g>
+        <g class="n" tabindex="0" role="button" data-k="供給" style="--d:1.2s;--c:#14b8a6"><rect x="14" y="114" width="64" height="32" rx="16"/><text x="46" y="135">供給</text></g>
+        <g class="n" tabindex="0" role="button" data-k="彈性" style="--d:1.5s;--c:#5b8def"><rect x="242" y="24" width="64" height="32" rx="16"/><text x="274" y="45">彈性</text></g>
+        <g class="n" tabindex="0" role="button" data-k="考點" style="--d:1.8s;--c:#ef4f6b"><rect x="242" y="114" width="64" height="32" rx="16"/><text x="274" y="135">考點</text></g></svg>`; return t.content.firstChild; })();
+      const pickNode = g => {
+        svg.querySelectorAll('g').forEach(x => x.classList.toggle('sel', x === g));
+        tip.classList.add('live'); tip.lastChild.textContent = NODE[g.dataset.k];
+        jelly(tip, .7, 500); sfx('tap'); buzz();
+      };
+      svg.addEventListener('click', e => { const g = e.target.closest('g'); if (g) pickNode(g); });
+      svg.addEventListener('keydown', e => { const g = e.target.closest('g'); if (g && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); pickNode(g); } });
+
+      const fold = (title, body) => { const d = h('button', { class: 'in-fold', onclick: () => { d.classList.toggle('open'); sfx('tap'); } }, h('b', null, icon('chevron-right'), title), h('span', null, body)); return d; };
+      const quiz = () => {
+        const res = h('p', { class: 'in-qres' });
+        const opts = h('div', { class: 'in-qopts' }, [['需求量增加，均衡價格下跌', false], ['出現超額需求，價格被往上推', true], ['供給線往右移動', false]].map(([t, ok]) =>
+          h('button', { onclick: e => {
+            if (opts.classList.contains('done')) return;
+            opts.classList.add('done'); e.currentTarget.classList.add(ok ? 'right' : 'wrong');
+            if (!ok) [...opts.children][1].classList.add('right');
+            res.textContent = ok ? '答對了！價格低於均衡時，想買的人比賣的多。' : '差一點。價格太低時買的人比賣的多，價格會被推高。';
+            jelly(e.currentTarget, ok ? 1 : .6); sfx(ok ? 'on' : 'off');
+          } }, t)));
+        const again = h('button', { class: 'in-again', onclick: () => { opts.classList.remove('done'); [...opts.children].forEach(c => c.classList.remove('right', 'wrong')); res.textContent = ''; } }, '再試一次');
+        return h('div', { class: 'in-quiz' }, h('span', { class: 'qz-kind' }, '選擇題'), h('b', null, '政府把價格壓在均衡價格以下，市場會怎樣？'), opts, res, again);
+      };
+      const PANES = {
+        '大綱筆記': () => h('div', { class: 'in-pane' }, h('p', { class: 'in-tip live' }, icon('sparkles'), h('span', null, '點標題可以展開')),
+          fold('12:48　供給與需求', '兩條線各自代表買方和賣方，在不同價格下願意交易的數量。'),
+          fold('24:10　市場均衡', '兩條線的交點。價格高於它會剩貨，低於它會缺貨。'),
+          fold('31:05　價格彈性', '衡量數量對價格有多敏感，決定漲價後收入是增是減。')),
+        '考點': () => h('div', { class: 'in-pane' },
+          h('div', { class: 'in-exam' }, h('i', null, '1'), h('div', null, h('b', null, '均衡價格的圖要會畫'), h('span', null, '教授講了三次「這個一定考」'))),
+          h('div', { class: 'in-exam' }, h('i', null, '2'), h('div', null, h('b', null, '價格彈性的計算'), h('span', null, '黑板上示範了兩題')))),
+        '心智圖': () => h('div', { class: 'in-pane' }, svg, tip),
+        '測驗': () => h('div', { class: 'in-pane' }, quiz()),
+      };
+      const pane = h('div', { class: 'in-pane-box' }, PANES['心智圖']());
+      const tabs = h('div', { class: 'in-tabs', role: 'tablist' }, Object.keys(PANES).map(t => h('button', { role: 'tab', class: t === '心智圖' ? 'on' : '', onclick: e => {
+        tabs.querySelectorAll('button').forEach(x => x.classList.toggle('on', x === e.currentTarget));
+        pane.replaceChildren(PANES[t]()); jellyIn(pane.firstChild, 'below'); sfx('tap'); buzz();
+      } }, t)));
+      return h('div', { class: 'in-demo in-card in-notes' }, tabs, pane,
+        h('div', { class: 'in-chips' }, h('span', { style: '--d:2.3s' }, icon('share'), '匯出 GoodNotes'), h('span', { style: '--d:2.6s' }, icon('languages'), '中英對照')));
+    },
+    tutor: () => h('div', { class: 'in-demo in-card in-chat' },
+      h('p', { class: 'me', style: '--d:.3s' }, '期中會考哪些？'),
+      h('p', { class: 'ai', style: '--d:1.3s' }, '教授提到兩個必考：均衡價格的圖', h('em', null, '12:48'), '和價格彈性的計算', h('em', null, '31:05'), '。'),
+      h('p', { class: 'me', style: '--d:2.6s' }, '彈性可以再講一次嗎？'),
+      h('p', { class: 'ai dots', style: '--d:3.4s' }, h('i'), h('i'), h('i'))),
+    smart: () => h('div', { class: 'in-demo in-smart' },
+      h('div', { class: 'in-col' }, h('b', null, '打開就能用'), h('span', null, '錄音、字幕、筆記、心智圖'), h('span', null, '全部免費，資料留在裝置')),
+      h('div', { class: 'in-plus' }, icon('plus')),
+      h('div', { class: 'in-col hot' }, h('b', null, icon('sparkles'), '接上 API 更聰明'), h('span', null, 'Claude 讀懂整堂課'), h('span', null, '中英混講、分辨講者'))),
+  };
+  const STEPS = [
+    ['hero', '蛤說啥', '上課，只要專心聽', '錄音、即時字幕、中英對照筆記，一次幫你整理好。往下滑，30 秒看完怎麼用。'],
+    ['captions', '第 1 步', '按下錄音，字幕馬上出現', '教授說的每一句話即時變成文字，旁邊附上另一種語言，還會分出是誰在講。'],
+    ['zoned', '上課中', '恍神了？按一下就跟上', '「我恍神了」會整理剛剛幾分鐘的重點、教授的提醒和新出現的名詞。'],
+    ['notes', '下課後', '自動變成一份完整筆記', '大綱筆記、考試重點、心智圖和測驗都有，還能匯出到 GoodNotes。下面這個可以直接點點看。'],
+    ['tutor', '複習時', '不懂的直接問助教', '助教讀過整堂課，回答會標出時間，點一下就能跳回去重聽那一段。'],
+    ['smart', '不用訂閱', '想更聰明，就接上 API', '所有功能都免費。之後在設定貼上自己的金鑰，筆記和字幕會變得更準。'],
+  ];
+  const close = () => {
+    Store.set('onboarded', true);
+    root.classList.add('leaving');
+    setTimeout(() => { root.remove(); document.documentElement.classList.remove('intro-open'); }, motionOn() ? 420 : 0);
+  };
+  const scroller = h('div', { class: 'in-scroll', tabindex: '0' }, STEPS.map(([k, eyebrow, title, text], i) =>
+    h('section', { class: 'in-step in-' + k + '-step', 'data-i': String(i) },
+      h('div', { class: 'in-text' }, h('span', { class: 'in-eyebrow' }, eyebrow), h(i ? 'h2' : 'h1', null, title), h('p', null, text),
+        i === 0 ? h('button', { class: 'in-hint', onclick: () => scroller.children[1].scrollIntoView({ behavior: 'smooth' }) }, '往下滑', icon('chevron-down'))
+          : i === STEPS.length - 1 ? h('div', { class: 'in-cta' },
+            h('button', { class: 'btn primary lg', onclick: close }, '開始使用', icon('chevron-right')),
+            h('button', { class: 'btn lg', onclick: () => { close(); go('#/settings'); } }, icon('zap'), '現在就貼金鑰')) : null),
+      scene[k]())));
+  const bar = h('i');
+  const dots = h('div', { class: 'in-dots' }, STEPS.map((st, i) => h('button', { 'aria-label': `第 ${i + 1} 段`, onclick: () => scroller.children[i].scrollIntoView({ behavior: 'smooth' }) })));
+  const root = h('div', { id: 'intro', role: 'dialog', 'aria-label': '使用教學' },
+    h('div', { class: 'in-top' }, h('div', { class: 'brand' }, h('span', { class: 'logo orb-logo' }, icon('audio-lines')), '蛤說啥'),
+      h('button', { class: 'btn sm in-skip', onclick: close }, '跳過', icon('chevron-right'))),
+    h('div', { class: 'in-progress' }, bar), scroller, dots);
+  document.body.append(root);
+  document.documentElement.classList.add('intro-open');
+  const io = new IntersectionObserver(es => es.forEach(e => {
+    if (e.isIntersecting) { e.target.classList.add('on'); dots.querySelectorAll('button').forEach((d, i) => d.classList.toggle('on', i === Number(e.target.dataset.i))); }
+    else if (e.intersectionRatio === 0) e.target.classList.remove('on');   // replays when you scroll back
+  }), { root: scroller, threshold: [0, .5] });
+  [...scroller.children].forEach(c => io.observe(c));
+  scroller.addEventListener('scroll', () => {
+    const max = scroller.scrollHeight - scroller.clientHeight;
+    bar.style.transform = `scaleX(${max ? scroller.scrollTop / max : 1})`;
+  }, { passive: true });
+  root.addEventListener('keydown', e => { if (e.key === 'Escape') close(); });
+  scroller.focus({ preventScroll: true });
 }
 
 /* account sheet: from the avatar on the home page */
@@ -1598,53 +1749,32 @@ function confirmSheet({ icon: ic, color = '#ef4f6b', title, text, ok, danger = f
   });
 }
 async function doSignOut() {
-  if (!(await confirmSheet({ icon: 'log-out', color: '#6b7280', title: '要登出嗎？', text: '登出後會回到免費版。你的課堂和筆記都還在這台裝置上，重新登入就能恢復進階版。', ok: '登出' }))) return;
-  Account.signOut();
-  Store.set('plan', 'free');
+  if (!(await confirmSheet({ icon: 'log-out', color: '#6b7280', title: '要登出嗎？', text: '你的課堂和筆記都還在這台裝置上，不會被刪除。', ok: '登出' }))) return;
+  await Account.signOut();
   toast('已登出', { icon: 'log-out' });
   render();
 }
 async function doDeleteAccount() {
-  const sub = Account.subscription();
   if (!(await confirmSheet({
     icon: 'trash-2', title: '刪除帳號？', danger: true, ok: '永久刪除帳號',
-    text: '會刪除你的帳號和用量紀錄，無法復原。這台裝置上的課堂和筆記不會被刪除。' + (sub ? ' 注意：刪除帳號不會自動取消 Apple 訂閱，請另外到 iPhone「設定 > Apple ID > 訂閱」取消，以免繼續扣款。' : ''),
+    text: '會刪除你的帳號和用量紀錄，無法復原。這台裝置上的課堂和筆記不會被刪除。',
   }))) return;
-  await Account.deleteAccount();
-  Store.set('plan', 'free');
+  try { await Account.deleteAccount(); } catch (e) { toast(e.message || '刪除失敗', { icon: 'info', ms: 5000 }); return; }
   toast('帳號已刪除', { icon: 'check' });
   render();
 }
-function manageSubscription() {
-  if (NATIVE) { location.href = 'https://apps.apple.com/account/subscriptions'; return; }
-  toast(Account.PREVIEW ? '上架後會打開 iPhone 的「訂閱」管理頁面' : '請到 iPhone「設定 > Apple ID > 訂閱」管理', { icon: 'info', ms: 3600 });
-}
 function accountCard() {
-  const a = Account.account(), sub = Account.subscription(), u = Account.usage();
-  const P = Account.PRODUCTS;
+  const a = Account.account();
   if (!a) {
     return h('div', { class: 'acct-card guest' },
       h('div', { class: 'acct-top' }, avatar(null, 54),
-        h('div', { class: 'grow' }, h('b', null, '尚未登入'), h('span', null, '目前使用免費版。登入後可以訂閱進階版。'))),
-      signInButtons(() => render(), { compact: true }),
-      h('button', { class: 'btn sm ghost', style: 'align-self:center', onclick: () => showPlans() }, '比較方案', icon('chevron-right')));
+        h('div', { class: 'grow' }, h('b', null, '尚未登入'), h('span', null, '登入後會顯示你的帳號。課堂和筆記仍存在這台裝置。'))),
+      signInButtons(() => render(), { compact: true }));
   }
-  return h('div', { class: 'acct-card' + (sub ? ' pro' : '') },
+  return h('div', { class: 'acct-card' },
     h('div', { class: 'acct-top' }, avatar(a, 54),
-      h('div', { class: 'grow' }, h('b', null, a.name), h('span', null, a.email)),
-      sub ? h('span', { class: 'badge pro' }, icon('crown'), '進階版') : h('span', { class: 'badge free' }, icon('gift'), '免費版')),
-    sub ? h('div', { class: 'acct-usage' },
-      h('div', { class: 'au-row' }, h('span', null, '本月即時字幕'), h('b', null, `剩 ${u.left.toFixed(1)} 小時`, h('small', null, ` ／ ${u.quota} 小時`))),
-      h('div', { class: 'meter' }, h('i', { style: `width:${Math.max(2, (u.used / (u.quota || 1)) * 100)}%` })),
-      h('div', { class: 'au-row muted small' }, h('span', null, `${P[sub.product].label}方案 · ${ntd(P[sub.product].price)}／${P[sub.product].per}`), h('span', null, '下次續訂 ' + new Date(sub.renews).toLocaleDateString('zh-TW')))) : null,
+      h('div', { class: 'grow' }, h('b', null, a.name), h('span', null, a.email))),
     h('div', { class: 'acct-actions' },
-      sub ? h('button', { class: 'btn sm', onclick: manageSubscription }, icon('credit-card'), '管理訂閱')
-        : h('button', { class: 'btn sm primary', onclick: () => showPlans() }, icon('crown'), '升級進階版'),
-      h('button', { class: 'btn sm', onclick: async e => {
-        const b = e.currentTarget; b.disabled = true;
-        const s = await Account.restore(); b.disabled = false;
-        if (s) { Store.set('plan', 'pro'); toast('已恢復進階版', { icon: 'crown' }); render(); } else toast('沒有找到訂閱紀錄', { icon: 'info' });
-      } }, icon('refresh-cw'), '恢復購買'),
       h('button', { class: 'btn sm ghost', onclick: doSignOut }, icon('log-out'), '登出')),
     h('button', { class: 'acct-delete', onclick: doDeleteAccount }, '刪除帳號'));
 }
@@ -1666,11 +1796,9 @@ async function renderHome() {
       planBadge(),
       themeButton(),
       h('button', { class: 'btn icon ghost', 'aria-label': '設定', onclick: () => go('#/settings') }, icon('settings')),
-      h('button', { class: 'btn icon ghost avatar-btn', 'aria-label': Account.account() ? '帳號' : '登入', title: Account.account() ? Account.account().name : '登入',
-        onclick: () => Account.account() ? go('#/settings') : showPlans({ step: 'signin' }) }, avatar(Account.account(), 30))),
+      Account.REAL_AUTH ? h('button', { class: 'btn icon ghost avatar-btn', 'aria-label': Account.account() ? '帳號' : '登入', title: Account.account() ? Account.account().name : '登入',
+        onclick: () => go('#/settings') }, avatar(Account.account(), 30)) : null),
     h('main', { class: 'page' },
-      cfg.plan === 'pro' && !Account.subscription() && (!cfg.sonioxKey || !cfg.anthropicKey) ? h('div', { class: 'banner' }, icon('info'),
-        h('div', null, h('b', null, '進階版還差一步：'), !cfg.sonioxKey ? ' 缺 Soniox 金鑰（先用免費辨識）。' : '', !cfg.anthropicKey ? ' 缺 Anthropic 金鑰（先用免費整理）。' : '', ' ', h('a', { href: '#/settings' }, '前往設定 →'))) : null,
       h('section', { class: 'hero' },
         h('div', { class: 'hero-art', 'aria-hidden': 'true' }, sticker('notebook-pen'), sticker('mic'), sticker('sparkles')),
         h('div', { class: 'hero-top' },
@@ -2102,7 +2230,7 @@ function renderSpeakers() {
   const ids = Object.keys(talkTimes(lec)).sort((a, b) => (speakerInfo(lec, b).isProf ? 1 : 0) - (speakerInfo(lec, a).isProf ? 1 : 0) || Number(a) - Number(b));
   const kids = ids.map(id => {
     const i = speakerInfo(lec, id);
-    return h('button', { class: 'spk-chip', title: id === '?' ? '免費版無法分辨講者' : '點一下可以改名或設定為教授', onclick: () => { if (id !== '?') speakerDialog(id); } },
+    return h('button', { class: 'spk-chip', title: id === '?' ? '接上 Soniox 才能分辨講者' : '點一下可以改名或設定為教授', onclick: () => { if (id !== '?') speakerDialog(id); } },
       avatarEl(i), i.name);
   });
   const canTranslate = proReady().notes || localTranslateSupported();
@@ -2254,7 +2382,7 @@ function showCatchUp() {
       h('div', { class: 'cu-chips' }, res.terms.map((t, j) => h('span', { class: 'cu-term', style: `--j:${j}` }, h('b', null, t.en), t.zh ? h('span', null, t.zh) : null)))) : null,
     h('div', { class: 'cu-foot' },
       engine === 'claude' ? h('span', { class: 'badge pro' }, icon('sparkles'), 'Claude 摘要')
-        : h('button', { class: 'badge free', onclick: () => { close(); showPlans(); } }, icon('gift'), '免費版：挑出關鍵句'),
+        : h('button', { class: 'badge free', onclick: () => { close(); showPlans(); } }, icon('gift'), '裝置整理：挑出關鍵句'),
       h('button', { class: 'btn sm', onclick: () => { close(); openTutor(`最後這 ${minutes} 分鐘教授講的內容，我最需要搞懂哪裡？請解釋給我聽。`); } }, icon('message-circle-question'), '問助教')));
   const run = async () => {
     const my = ++token;
@@ -2364,7 +2492,7 @@ function chatBubble(m) {
   if (m.role === 'user') return h('div', { class: 'msg me' }, h('div', { class: 'bubble' }, m.text));
   let content;
   if (m.pending && !m.text) content = h('div', { class: 'typing' }, h('i'), h('i'), h('i'));
-  else if (m.engine === 'claude' || m.engine === 'error') content = richText(m.text);
+  else if (m.engine === 'claude' || m.engine === 'local' || m.engine === 'error') content = richText(m.text);
   else if (m.empty) content = [h('p', null, '這堂課的逐字稿和筆記裡找不到相關的內容。可以換個說法試試看，或用課堂上出現的關鍵字問。')];
   else content = [h('p', null, '我在這堂課找到這些：'), ...(m.blocks || []).map(b => h('div', { class: 'ans-block' },
     h('div', { class: 'ans-title' }, b.title),
@@ -2372,7 +2500,8 @@ function chatBubble(m) {
   return h('div', { class: 'msg bot' + (m.engine === 'error' ? ' err' : '') },
     h('span', { class: 'bot-av' }, icon('graduation-cap')),
     h('div', { class: 'bubble' }, content,
-      !m.pending && m.engine === 'free' ? h('button', { class: 'upsell', onclick: () => showPlans() }, icon('sparkles'), '進階版會由 Claude 直接回答，並標出時間') : null));
+      !m.pending && m.engine === 'local' ? h('span', { class: 'engine-tag' }, icon('cpu'), '裝置上的 AI 回答') : null,
+      !m.pending && m.engine === 'free' ? h('button', { class: 'upsell', onclick: () => showPlans() }, icon('sparkles'), '接上 API，Claude 會直接回答並標出時間') : null));
 }
 function paintChat(scroll = true) {
   const list = $('#chat-list'); if (!list) return;
@@ -2383,7 +2512,7 @@ function paintChat(scroll = true) {
     list.replaceChildren(h('div', { class: 'chat-intro' },
       h('div', { class: 'ci-art' }, h('span', { class: 'ob-glow' }), h('span', { class: 'sticker', style: '--sz:64px;--r:-6deg;--a:#5b8def;--b:#8b5cf6' }, icon('graduation-cap'))),
       h('h3', null, '我是這堂課的助教'),
-      h('p', { class: 'muted' }, ai ? '我讀過這堂課的逐字稿、講義和筆記，回答時會標出時間，點一下就能回去聽。' : '免費版會幫你在逐字稿和筆記裡找出相關的段落；進階版由 Claude 直接回答。'),
+      h('p', { class: 'muted' }, ai ? '我讀過這堂課的逐字稿、講義和筆記，回答時會標出時間，點一下就能回去聽。' : '我會幫你在逐字稿和筆記裡找出相關的段落；接上 API 後由 Claude 直接回答。'),
       h('div', { class: 'ci-sugs' }, Tutor.SUGGESTIONS.map(([ic, q], j) => h('button', { class: 'ci-sug', style: `--j:${j}`, onclick: () => askTutor(q) }, icon(ic), h('span', null, q))))));
     return;
   }
@@ -2419,6 +2548,14 @@ async function askTutor(q) {
       msg.engine = 'claude';
       let t = 0;
       msg.text = await claudeTutor(lec, msg, snap => { msg.text = snap; const n = Date.now(); if (n - t > 60) { t = n; updateLastBubble(); } });
+    } else if (await LocalAI.ready()) {
+      let t = 0, ok = false;
+      try {
+        msg.engine = 'local';
+        msg.text = await localTutor(lec, q, snap => { msg.text = snap; const n = Date.now(); if (n - t > 80) { t = n; updateLastBubble(); } });
+        ok = !!msg.text;
+      } catch (e) { console.warn('on-device AI failed', e); }
+      if (!ok) { msg.engine = 'free'; msg.text = ''; Object.assign(msg, Tutor.freeAnswer(q, { segs: lec.segments.filter(s => s.text.trim()), textOf: segText, notes: lec.notes, fmtTime, isProf: isProfSeg, endMs: lectureNowMs() })); }
     } else {
       await wait(500);
       Object.assign(msg, Tutor.freeAnswer(q, { segs: lec.segments.filter(s => s.text.trim()), textOf: segText, notes: lec.notes, fmtTime, isProf: isProfSeg, endMs: lectureNowMs() }));
@@ -2461,7 +2598,7 @@ function openTutor(q) {
 /* ---------- notes pane ---------- */
 const NOTE_TABS = [
   { v: 'overview', label: '總覽', icon: 'book-open' },
-  { v: 'outline', label: '大綱', icon: 'list-tree' },
+  { v: 'outline', label: '大綱筆記', icon: 'list-tree' },
   { v: 'mindmap', label: '心智圖', icon: 'network' },
   { v: 'tables', label: '名詞表', icon: 'table' },
   { v: 'exam', label: '考點', icon: 'target' },
@@ -2492,10 +2629,10 @@ function renderNotesPane() {
       h('p', null, lec.segments.length ? '錄完音後按下面的按鈕，就會結合逐字稿和講義整理出筆記。' :
         (lec.files && lec.files.length ? '只有講義也能先產生「預習筆記」，上完課再重新整理一次。' : '先錄音或上傳講義，就可以整理筆記。')),
       h('div', { style: 'display:flex;justify-content:center;gap:8px;flex-wrap:wrap;margin-bottom:16px' },
-        pr.notes ? h('span', { class: 'badge pro' }, icon('sparkles'), 'Claude AI 整理') : h('button', { class: 'badge free', onclick: () => showPlans() }, icon('gift'), '免費版：在裝置上自動整理')),
+        pr.notes ? h('span', { class: 'badge pro' }, icon('sparkles'), 'Claude AI 整理') : h('button', { class: 'badge free', onclick: () => showPlans() }, icon('gift'), '在裝置上自動整理')),
       h('button', { class: 'btn primary lg', disabled: !has || recording, onclick: generateNotes }, icon('sparkles'), '整理筆記'),
       recording ? h('p', { class: 'small muted', style: 'margin:12px auto 0' }, '錄音結束後才能整理') : null,
-      !pr.notes && !recording ? h('p', { class: 'small', style: 'margin:14px auto 0' }, '想要更聰明的筆記？', h('a', { href: '#', onclick: e => { e.preventDefault(); showPlans(); } }, '看看進階版')) : null)));
+      !pr.notes && !recording ? h('p', { class: 'small', style: 'margin:14px auto 0' }, '想要更聰明的筆記？', h('a', { href: '#', onclick: e => { e.preventDefault(); showPlans(); } }, '接上 API 試試')) : null)));
     return;
   }
   const tabs = seg(NOTE_TABS, state.noteTab, v => { state.noteTab = v; renderNotesBody(); jellyIn($('#notes-body')); }, 'tabs');
@@ -2516,7 +2653,7 @@ function noteSection(tab, n) {
   switch (tab) {
     case 'overview': return [
       h('div', { class: 'engine-line' },
-        n.engine === 'free' ? h('button', { class: 'badge free', onclick: () => showPlans(), title: '比較方案' }, icon('gift'), '免費版自動整理') : h('span', { class: 'badge pro' }, icon('sparkles'), 'Claude AI 筆記'),
+        n.engine === 'free' ? h('button', { class: 'badge free', onclick: () => showPlans(), title: '怎麼更聰明？' }, icon('gift'), '裝置自動整理') : h('span', { class: 'badge pro' }, icon('sparkles'), 'Claude AI 筆記'),
         h('span', { class: 'muted small' }, lec.notesAt ? new Date(lec.notesAt).toLocaleString('zh-TW', { hour12: false, month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : ''),
         h('span', { style: 'flex:1' }),
         h('div', { class: 'note-actions' },
@@ -2533,11 +2670,7 @@ function noteSection(tab, n) {
           ? h('button', { class: 'cal-btn done', onclick: () => calendarSheet(o) }, icon('check'), '已加入')
           : h('button', { class: 'cal-btn', onclick: () => calendarSheet(o) }, icon('calendar-plus'), '加入行事曆'))))) : null,
     ];
-    case 'outline': return n.outline.length ? h('div', { class: 'timeline' }, n.outline.map((s, k) => h('div', { class: 'tl-item', style: `--i:${k}` },
-      h('h4', null, s.time ? timeChip(s.time) : null, bi(s.heading)),
-      h('ul', null, s.points.map(p => h('li', { class: p.emphasis ? 'em' : '' }, bi(p.text),
-        p.emphasis ? h('span', { class: 'tag star' }, icon('star'), '重點') : null,
-        p.source === 'slides' ? h('span', { class: 'tag slide' }, '講義') : null)))))) : emptyNote('沒有足夠的內容建立大綱。');
+    case 'outline': return n.outline.length ? outlineNotes(n) : emptyNote('沒有足夠的內容建立大綱筆記。');
     case 'mindmap': return n.mind_map.branches.length ? mindMapPanel(n.mind_map) : emptyNote('沒有足夠的內容建立心智圖。');
     case 'tables': return [
       n.key_terms.length ? sec('專有名詞', 'languages', h('div', { class: 'tbl-wrap' }, h('table', null,
@@ -2559,16 +2692,7 @@ function noteSection(tab, n) {
       h('div', { class: 'r' }, h('span', { class: 'k a' }, 'A'), h('div', null, bi(q.answer))),
       q.asked_by ? h('div', { class: 'muted small', style: 'margin-top:8px' }, '提問：' + q.asked_by) : null)) :
       emptyNote('這堂課沒有記錄到提問。');
-    case 'quiz': {
-      const grid = h('div', { class: 'flash' }, n.review_questions.map((q, k) => h('button', { class: 'fcard', style: `--i:${k}`, onclick: e => { e.currentTarget.classList.toggle('open'); sfx('flip'); } },
-        h('div', { class: 'inner' },
-          h('div', { class: 'face front' }, h('span', { class: 'lbl' }, `問題 ${k + 1}`), h('b', null, bi(q.question)), h('span', { class: 'hint' }, icon('refresh-cw'), '點一下翻面看答案')),
-          h('div', { class: 'face back' }, h('span', { class: 'lbl' }, '答案'), h('div', null, bi(q.answer)))))));
-      return n.review_questions.length ? [
-        h('div', { class: 'quiz-bar' }, h('span', { class: 'muted small' }, `共 ${n.review_questions.length} 題，先自己回答再翻面。`),
-          h('button', { class: 'btn sm', onclick: () => { const all = grid.querySelectorAll('.fcard'); const open = [...all].some(c => !c.classList.contains('open')); all.forEach((c, k) => setTimeout(() => c.classList.toggle('open', open), k * 60)); } }, icon('refresh-cw'), '全部翻面')),
-        grid] : emptyNote('沒有測驗題。');
-    }
+    case 'quiz': return quizView(n);
     default: return null;
   }
 }
@@ -2630,6 +2754,162 @@ function calendarSheet(o) {
       h('button', { class: 'btn ghost block', onclick: () => dlg.closeDialog() }, '取消')),
   ], { cls: 'sheet' });
 }
+// 大綱筆記: the outline written out as real notes — each section has its one-line gist, the points with the professor's
+// explanation, the terms and exam points that belong to it, and room for the student's own notes.
+const outlineTerms = new WeakMap();   // notes → the terms shown under each section (the export uses the same ones)
+function outlineNotes(n) {
+  const lec = state.lecture;
+  const secTerms = []; outlineTerms.set(n, secTerms);
+  let inkTimer = 0;
+  const inkChanged = () => { clearTimeout(inkTimer); inkTimer = setTimeout(() => saveLecture(lec), 700); };
+  const NUM = '一二三四五六七八九十';
+  const num = k => (k < 10 ? NUM[k] : k < 20 ? '十' + (k === 10 ? '' : NUM[k - 10]) : String(k + 1));
+  const has = o => !!(o && (o.zh || o.en));
+  const starts = n.outline.map(o => parseTime(o.time));
+  const inSection = (ms, k) => {
+    if (ms == null || starts[k] == null) return false;
+    const next = starts.slice(k + 1).find(x => x != null);
+    return ms >= starts[k] && (next == null || ms < next);
+  };
+  const usedTerm = new Set();
+  const sections = n.outline.map((sec, k) => {
+    const text = [sec.heading, sec.summary, ...sec.points.flatMap(p => [p.text, p.detail])].map(o => (o ? (o.zh || '') + ' ' + (o.en || '') : '')).join(' ').toLowerCase();
+    const said = new Set(sec.points.flatMap(p => [p.text.zh, p.text.en]).filter(Boolean).map(x => x.toLowerCase()));
+    const terms = (n.key_terms || []).filter(t => {
+      const id = (t.term_en || t.term_zh || '').toLowerCase();
+      if (!id || usedTerm.has(id) || !has(t.definition)) return false;
+      const def = (t.definition.zh || t.definition.en || '').toLowerCase();
+      if (said.has(def)) return false;   // the definition is already written out as a point here
+      const hit = [t.term_zh, t.term_en].filter(Boolean).some(w => text.includes(w.toLowerCase()));
+      if (hit) usedTerm.add(id);
+      return hit;
+    }).slice(0, 4);
+    secTerms[k] = terms;
+    const dup = o => !!o && [o.zh, o.en].filter(Boolean).some(x => said.has(x.toLowerCase()));   // already written as a point
+    const exams = (n.exam_focus || []).filter(e => inSection(parseTime(e.time), k) && !dup(e.point));
+    const examPts = new Set((n.exam_focus || []).flatMap(e => [e.point.zh, e.point.en]).filter(Boolean).map(x => x.toLowerCase()));
+    const isExam = p => [p.text.zh, p.text.en].filter(Boolean).some(x => examPts.has(x.toLowerCase()));
+    const mine = h('div', { class: 'on-mine', contenteditable: 'true', role: 'textbox', 'aria-multiline': 'true', 'aria-label': '我的筆記', 'data-ph': '寫下自己的筆記、疑問或老師畫的重點…' });
+    mine.textContent = (lec.myNotes && lec.myNotes[k]) || '';
+    mine.addEventListener('blur', () => {
+      const v = mine.innerText.trim();
+      if (v === ((lec.myNotes && lec.myNotes[k]) || '')) return;
+      lec.myNotes = lec.myNotes || {};
+      if (v) lec.myNotes[k] = v; else delete lec.myNotes[k];
+      saveLecture(lec); toast('已儲存你的筆記', { icon: 'check', ms: 1400 });
+    });
+    return h('section', { class: 'on-sec', style: `--i:${k}` },
+      h('header', { class: 'on-head', onclick: e => { if (e.target.closest('button,a')) return; e.currentTarget.parentElement.classList.toggle('shut'); sfx('tap'); } },
+        h('span', { class: 'on-num' }, num(k)),
+        h('h4', null, bi(sec.heading)),
+        sec.time ? timeChip(sec.time) : null,
+        h('span', { class: 'on-caret' }, icon('chevron-down'))),
+      has(sec.summary) && !dup(sec.summary) ? h('p', { class: 'on-gist' }, bi(sec.summary)) : null,
+      h('div', { class: 'on-body' },
+        h('ul', { class: 'on-points' }, sec.points.map(p => h('li', { class: p.emphasis ? 'em' : '' },
+          h('div', { class: 'on-pt' }, h('span', { class: 'on-hl' }, bi(p.text)),
+            isExam(p) ? h('span', { class: 'tag star' }, icon('star'), '考點') : p.emphasis ? h('span', { class: 'tag star' }, icon('star'), '重點') : null,
+            p.source === 'slides' ? h('span', { class: 'tag slide' }, '講義') : null),
+          has(p.detail) ? h('div', { class: 'on-detail' }, bi(p.detail)) : null))),
+        terms.length ? h('div', { class: 'on-terms' }, terms.map(t => h('div', { class: 'on-term' },
+          h('b', null, t.term_zh || t.term_en, t.term_zh && t.term_en ? h('i', null, t.term_en) : null), h('span', null, bi(t.definition))))) : null,
+        exams.map(e => h('div', { class: 'on-exam' }, icon('star'), h('div', null, h('b', null, '考點　'), bi(e.point), has(e.why) ? h('span', { class: 'on-why' }, bi(e.why)) : null))),
+        h('div', { class: 'on-mine-box' }, h('span', { class: 'on-mine-lbl' }, icon('notebook-pen'), '我的筆記'), mine),
+        inkBox(k)));
+  });
+  // Handwriting: a pad under each section. Opens on its own when there is already writing in it.
+  function inkBox(k) {
+    const box = h('div', { class: 'on-ink' });
+    const open = () => {
+      lec.ink = lec.ink || {};
+      const data = lec.ink[k] || (lec.ink[k] = { h: 0.42, strokes: [] });
+      box.replaceChildren(inkPad(data, { h, icon, onChange: inkChanged, penOnly: Store.get('penSeen', false), onPenSeen: () => Store.set('penSeen', true) }));
+    };
+    if (hasInk(lec.ink && lec.ink[k])) open();
+    else box.append(h('button', { class: 'on-ink-open', onclick: () => { open(); sfx('tap'); } }, icon('pencil'), '手寫筆記', h('span', null, '用觸控筆或手指直接寫')));
+    return box;
+  }
+  const doc = h('div', { class: 'on-doc' + (Store.get('outlineMode', 'notes') === 'outline' ? ' brief' : '') }, sections);
+  const total = n.outline.reduce((a, o) => a + o.points.length, 0);
+  return [
+    h('div', { class: 'quiz-bar' },
+      h('span', { class: 'muted small' }, `共 ${n.outline.length} 段・${total} 個要點`),
+      h('button', { class: 'btn sm gn-btn', onclick: exportOutlineGoodNotes }, icon('notebook-pen'), '匯出到 GoodNotes'),
+      seg([{ v: 'notes', label: '完整筆記' }, { v: 'outline', label: '只看大綱' }], Store.get('outlineMode', 'notes'), v => { Store.set('outlineMode', v); doc.classList.toggle('brief', v === 'outline'); doc.querySelectorAll('.shut').forEach(x => x.classList.remove('shut')); }, 'seg')),
+    doc];
+}
+// The quiz: multiple choice and fill-in-the-blank. Notes saved before quizzes existed get one built from their terms and key points.
+const quizCache = new WeakMap();
+function quizOf(n) {
+  if (n.quiz && n.quiz.length) return n.quiz;
+  if (!quizCache.has(n)) quizCache.set(n, buildQuiz(n));
+  return quizCache.get(n);
+}
+const normAns = t => String(t || '').toLowerCase().replace(/[\s\u3000。，、．.,;；:：!?！？'"「」『』()（）\-＿_]/g, '');
+function quizView(n) {
+  const qs = quizOf(n);
+  if (!qs.length) return emptyNote('這堂課的內容還不夠出題。名詞和重點多一點之後，重新整理筆記就會有測驗。');
+  const state_ = qs.map(() => null);          // null = not answered, true / false = result
+  const score = h('b', null, '0');
+  const done = h('span', null, '0');
+  const bar = h('i');
+  const box = h('div', { class: 'quiz-list' });
+  const update = () => {
+    const answered = state_.filter(x => x !== null).length, right = state_.filter(x => x === true).length;
+    score.textContent = String(right); done.textContent = String(answered);
+    bar.style.width = (answered / qs.length) * 100 + '%';
+    if (answered === qs.length) {
+      const pct = Math.round((right / qs.length) * 100);
+      toast(pct === 100 ? '全對！這堂課你都懂了' : pct >= 70 ? `答對 ${right}／${qs.length}，再看一下錯的那幾題` : `答對 ${right}／${qs.length}，建議回去重聽錯的地方`, { icon: pct >= 70 ? 'check' : 'info', ms: 4200 });
+      if (pct === 100) bloom();
+    }
+  };
+  const explain = q => h('div', { class: 'qz-exp' }, icon('sparkles'), h('div', null, bi(q.explanation)));
+  const card = (q, k) => {
+    const el = h('div', { class: 'qz ' + q.type, style: `--i:${k}` },
+      h('div', { class: 'qz-head' }, h('span', { class: 'qz-no' }, String(k + 1)), h('span', { class: 'qz-kind' }, q.type === 'choice' ? '選擇題' : '填充題')),
+      h('div', { class: 'qz-q' }, bi(q.question)));
+    const finish = ok => { state_[k] = ok; el.classList.add('answered', ok ? 'right' : 'wrong'); if (q.explanation && (q.explanation.zh || q.explanation.en)) el.append(explain(q)); sfx(ok ? 'on' : 'off'); buzz(ok ? 'success' : 'medium'); update(); };
+    if (q.type === 'choice') {
+      const order = q.options.map((_, i) => i).sort(() => Math.random() - .5);   // so the right answer isn't always in the same spot
+      const opts = h('div', { class: 'qz-opts' }, order.map((oi, j) => h('button', { class: 'qz-opt', onclick: e => {
+        if (state_[k] !== null) return;
+        const ok = oi === q.answer_index;
+        e.currentTarget.classList.add(ok ? 'right' : 'wrong');
+        if (!ok) opts.children[order.indexOf(q.answer_index)]?.classList.add('right');
+        jelly(e.currentTarget, ok ? 1 : .6);
+        finish(ok);
+      } }, h('span', { class: 'qz-key' }, 'ABCD'[j] || '•'), h('span', null, bi(q.options[oi])))));
+      el.append(opts);
+    } else {
+      const accepted = [q.answer.zh, q.answer.en].filter(Boolean);
+      const input = h('input', { class: 'input', placeholder: '填入答案', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false', 'aria-label': `第 ${k + 1} 題答案` });
+      const check = reveal => {
+        if (state_[k] !== null) return;
+        const v = normAns(input.value);
+        if (!v && !reveal) { jelly(input, .5); input.focus(); return; }
+        const ok = !reveal && accepted.some(a => { const x = normAns(a); return x && (v === x || (v.length >= 2 && v.includes(x))); });
+        input.disabled = true;
+        el.append(h('div', { class: 'qz-ans' }, ok ? '答對了：' : '正確答案：', h('b', null, accepted.join(' / '))));
+        finish(ok);
+      };
+      input.addEventListener('keydown', e => { if (e.key === 'Enter') check(false); });
+      el.append(h('div', { class: 'qz-fill' }, input,
+        h('button', { class: 'btn primary', onclick: () => check(false) }, '對答案'),
+        h('button', { class: 'btn ghost', onclick: () => check(true) }, '不會，看答案')));
+    }
+    return el;
+  };
+  const paint = () => { state_.fill(null); box.replaceChildren(...qs.map(card)); update(); };
+  paint();
+  const nC = qs.filter(q => q.type === 'choice').length;
+  return [
+    h('div', { class: 'quiz-bar qz-bar' },
+      h('div', { class: 'grow' }, h('div', { class: 'muted small' }, `選擇題 ${nC} 題・填充題 ${qs.length - nC} 題`), h('div', { class: 'meter' }, bar)),
+      h('div', { class: 'qz-score' }, '答對 ', score, ' ／ 已答 ', done),
+      h('button', { class: 'btn sm', onclick: paint }, icon('refresh-cw'), '重新作答')),
+    box];
+}
 const emptyNote = t => h('div', { class: 'empty', style: 'padding:30px 10px' }, h('p', null, t));
 function cornell(n) {
   const rows = n.review_questions.slice(0, 8);
@@ -2679,6 +2959,7 @@ const audioExt = b => ((b.type || '').includes('mp4') || (b.type || '').includes
 function notesDocHTML(lec) {
   const n = lec.notes;
   return notesDocument(lec, n, {
+    quiz: quizOf(n),
     lang: state.lang, mmCSS: MM_NODE_CSS, fmtDate, fmtTime,
     mindMapHTML: n.mind_map && n.mind_map.branches && n.mind_map.branches.length ? staticMindMapHTML(n.mind_map, mmText, 640, 900) : '',
   });
@@ -2711,6 +2992,81 @@ async function sendFileToApp(name, blob, onPart) {
 function busyToast(text) {
   const t = toast(text, { icon: 'refresh-cw', ms: 120000 });
   return { set: s => { const el = document.querySelector('.toast:last-child span'); if (el) el.textContent = s; }, done: () => { document.querySelectorAll('.toast').forEach(x => x.textContent.startsWith(text.slice(0, 4)) && x.remove()); void t; } };
+}
+// ---- 大綱筆記 → a real PDF file, handed straight to GoodNotes through the share sheet ----
+const loadScript = src => new Promise((res, rej) => {
+  if (document.querySelector(`script[src="${src}"]`)) return res();
+  const el = document.createElement('script'); el.src = src; el.onload = res; el.onerror = () => rej(new Error('無法載入 PDF 元件，請確認網路連線')); document.head.append(el);
+});
+async function outlinePDF(lec, onStep) {
+  const n = lec.notes;
+  await Promise.all([loadScript('https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js'), loadScript('https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js')]);
+  if (!outlineTerms.has(n)) outlineNotes(n);
+  const ink = {};
+  for (const [k, d] of Object.entries(lec.ink || {})) { const img = inkImage(d); if (img) ink[k] = img; }
+  const blocks = outlineBlocks(lec, n, { lang: state.lang, fmtDate, fmtTime, ink, terms: outlineTerms.get(n) || [] });
+  const root = h('div', { class: 'gnx' });
+  root.innerHTML = `<style>${OUTLINE_CSS}</style><div class="g-flow"></div>`;
+  document.body.append(root);
+  try {
+    const flow = root.querySelector('.g-flow');
+    flow.innerHTML = blocks.join('');
+    await Promise.all([...flow.querySelectorAll('img')].map(i => (i.decode ? i.decode().catch(() => {}) : null)));
+    // Fill A4 pages block by block, so a section is never cut in half.
+    const ROOM = 1123 - 54 - 60 - 8;
+    const pages = []; let cur = null, used = 0;
+    for (const b of [...flow.children]) {
+      const cs = getComputedStyle(b);
+      const hgt = b.offsetHeight + parseFloat(cs.marginTop) + parseFloat(cs.marginBottom);
+      const filler = b.classList.contains('g-write');
+      if (!cur || (used + hgt > ROOM && !(filler && used + 40 <= ROOM))) {
+        if (filler && cur) continue;                 // no ruled lines stranded at the top of a new page
+        // The next section starts on a fresh page: rule the space left on this one, so it can be written on in GoodNotes.
+        if (cur && ROOM - used >= 90) cur.append(h('div', { class: 'g-write' }, Array.from({ length: Math.floor((ROOM - used - 12) / 34) }, () => h('i'))));
+        cur = h('div', { class: 'g-page' }); pages.push(cur); used = 0;
+      }
+      if (filler && used + hgt > ROOM) { [...b.children].slice(Math.max(1, Math.floor((ROOM - used) / 34))).forEach(x => x.remove()); }
+      cur.append(b); used += Math.min(hgt, ROOM - used);
+    }
+    flow.remove();
+    pages.forEach((pg, i) => { pg.append(h('div', { class: 'g-foot' }, h('span', null, `${lec.course ? lec.course + ' · ' : ''}${n.title.zh || n.title.en || lec.title}`), h('span', null, `${i + 1} / ${pages.length}`))); root.append(pg); });
+    const pdf = new window.jspdf.jsPDF({ unit: 'pt', format: 'a4', compress: true });
+    for (let i = 0; i < pages.length; i++) {
+      onStep && onStep(i + 1, pages.length);
+      const canvas = await window.html2canvas(pages[i], { scale: 2, backgroundColor: '#ffffff', logging: false, useCORS: true, x: 0, y: 0, scrollX: 0, scrollY: 0, windowWidth: 794 });
+      if (i) pdf.addPage();
+      pdf.addImage(canvas.toDataURL('image/jpeg', 0.92), 'JPEG', 0, 0, 595.28, 841.89, undefined, 'FAST');
+    }
+    return { blob: pdf.output('blob'), pages: pages.length };
+  } finally { root.remove(); }
+}
+async function exportOutlineGoodNotes() {
+  const lec = state.lecture; if (!lec || !lec.notes) return;
+  sfx('tap');
+  const b = busyToast('正在把大綱筆記排成 PDF…');
+  let out;
+  try { out = await outlinePDF(lec, (i, nPages) => b.set(`正在排版第 ${i}／${nPages} 頁…`)); }
+  catch (e) { console.error(e); b.done(); toast('匯出失敗：' + (e.message || e), { icon: 'info', ms: 5000 }); return; }
+  b.done();
+  const name = `${safeName(lec.notes.title.zh || lec.title)}-大綱筆記.pdf`;
+  const file = new File([out.blob], name, { type: 'application/pdf' });
+  const canShare = !!(navigator.canShare && navigator.canShare({ files: [file] }));
+  const url = URL.createObjectURL(out.blob);
+  let dlg;
+  dlg = openDialog([
+    h('div', { class: 'cal-head' }, h('span', { class: 'sticker', style: '--sz:46px;--r:-8deg;--a:#f59e0b;--b:#ef4444;animation:none' }, icon('notebook-pen')),
+      h('div', null, h('h3', { style: 'margin:0' }, 'PDF 準備好了'), h('div', { class: 'muted small' }, `${name} · ${out.pages} 頁 · ${(out.blob.size / 1048576).toFixed(1)} MB`))),
+    h('p', { class: 'muted', style: 'margin:12px 0 0;line-height:1.65' }, canShare
+      ? '按下面的按鈕，在分享選單選「Goodnotes」，就會變成一本新的筆記本，可以直接在上面繼續寫。'
+      : '這個瀏覽器不能直接分享檔案。先下載 PDF，再到 GoodNotes 按「＋」→「匯入」選這個檔案。'),
+    h('div', { class: 'cal-actions' },
+      canShare ? h('button', { class: 'btn primary lg block', onclick: async () => {
+        try { await navigator.share({ files: [file], title: name }); dlg.closeDialog(); }
+        catch (e) { if (e.name !== 'AbortError') toast('分享失敗，請改用下載', { icon: 'info' }); }
+      } }, icon('share'), '傳到 GoodNotes') : null,
+      h('a', { class: 'btn lg block' + (canShare ? '' : ' primary'), href: url, download: name }, icon('download'), '下載 PDF'),
+      h('button', { class: 'btn ghost block', onclick: () => dlg.closeDialog() }, '關閉')),
+  ], { cls: 'sheet', onClose: () => setTimeout(() => URL.revokeObjectURL(url), 60000) });
 }
 async function exportGoodNotes() {
   const lec = state.lecture; if (!lec || !lec.notes) return;
@@ -2806,7 +3162,8 @@ function buildMarkdown(lec) {
   L.push('');
   if (n.exam_focus.length) { L.push('## 考試重點 Exam focus'); n.exam_focus.forEach(e => L.push(`- **${pair(e.point)}**  \n  ${pair(e.why)}`)); L.push(''); }
   if (n.class_qa.length) { L.push('## 課堂問答 Q&A'); n.class_qa.forEach(q => L.push(`**Q:** ${mdBi(q.question)}  \n**A:** ${mdBi(q.answer)}`, '')); }
-  L.push('## 自我測驗 Review'); n.review_questions.forEach((q, k) => L.push(`${k + 1}. ${pair(q.question)}  \n   答：${pair(q.answer)}`)); L.push('');
+  L.push('## 自我測驗 Review'); quizOf(n).forEach((q, k) => { L.push(`${k + 1}. ${q.type === 'choice' ? '（選擇）' : '（填充）'}${pair(q.question)}`); q.options.forEach((o, j) => L.push(`   - (${'ABCD'[j]}) ${pair(o)}`)); });
+  L.push(''); L.push('### 解答'); quizOf(n).forEach((q, k) => L.push(`${k + 1}. ${q.type === 'choice' ? '(' + 'ABCD'[q.answer_index] + ') ' + pair(q.options[q.answer_index]) : pair(q.answer)}${pair(q.explanation) ? '　—　' + pair(q.explanation) : ''}`)); L.push('');
   if (n.todo.length) { L.push('## 待辦 To-do'); n.todo.forEach(o => L.push(`- [ ] ${pair(o)}`)); L.push(''); }
   L.push('## 總結 Summary', mdBi(n.summary), '', '---', '## 逐字稿 Transcript');
   let prev = null;
@@ -2922,7 +3279,7 @@ async function renderSettings() {
       onchange: async e => {
         const v = e.target.value.trim();
         Store.set(key, v);
-        if (key === 'anthropicKey' && v) { Store.set('plan', 'pro'); renderSettings(); testClaude(); return; }
+        if (key === 'anthropicKey' && v) { renderSettings(); testClaude(); return; }
         toast(v ? '金鑰已儲存' : '金鑰已移除', { icon: 'lock' }); renderSettings();
       },
     });
@@ -2940,7 +3297,7 @@ async function renderSettings() {
       h('div', { class: 'grow brand' }, '設定'),
       themeButton()),
     h('main', { class: 'page' }, h('div', { class: 'settings' },
-      group('帳號', accountCard()),
+      Account.REAL_AUTH ? group('帳號', accountCard()) : null,
       group('外觀',
         colRow('palette', '#9b51e0', '主題', '跟著系統，或固定淺色／深色',
           seg([{ v: 'system', label: '系統', icon: 'monitor' }, { v: 'light', label: '淺色', icon: 'sun' }, { v: 'dark', label: '深色', icon: 'moon' }],
@@ -2966,23 +3323,30 @@ async function renderSettings() {
             onchange: () => sfx('tap'),
           }))),
       group('錄音與字幕',
-        colRow('languages', '#1b84d1', '教授主要使用的語言', '免費版一次只能辨識一種語言；進階版可中英混講',
+        colRow('languages', '#1b84d1', '教授主要使用的語言', '內建辨識一次只能一種語言；接上 Soniox 可中英混講',
           seg([{ v: 'zh', label: '中文為主' }, { v: 'en', label: '英文為主' }], cfg.mainLang, v => Store.set('mainLang', v), 'seg full')),
-        row('captions', '#17946f', '即時翻譯', pro ? '每句旁邊顯示另一種語言（Soniox）' : (localTranslateSupported() ? '使用瀏覽器內建翻譯（電腦版 Chrome）' : '這個瀏覽器沒有免費翻譯；進階版可用'),
+        row('captions', '#17946f', '即時翻譯', pro ? '每句旁邊顯示另一種語言（Soniox）' : (localTranslateSupported() ? '使用瀏覽器內建翻譯（電腦版 Chrome）' : '這個瀏覽器沒有內建翻譯；接上 Soniox 可用'),
           switchEl(cfg.translate, v => Store.set('translate', v), '即時翻譯')),
         row('headphones', '#e07a2e', '保存錄音檔', '可以點逐字稿回放那段錄音；一小時約 15 MB', switchEl(cfg.saveAudio, v => Store.set('saveAudio', v), '保存錄音檔')),
+        !NATIVE ? row('mic', '#ec4899', '加強收音（坐後排也聽得到）', '把遠處講者的聲音放大、濾掉冷氣和桌椅的低頻噪音，再交給內建辨識。只影響辨識，不影響保存的錄音',
+          switchEl(Store.get('farField', true), v => Store.set('farField', v), '加強收音')) : null,
         NATIVE ? row('sparkles', '#8b5cf6', '辨識更準確', '有網路時交給 Apple 伺服器辨識，比手機上辨識準；關閉則完全在手機上處理',
           switchEl(Store.get('accurateSpeech', true), v => Store.set('accurateSpeech', v), '辨識更準確')) : null,
         NATIVE ? row('audio-lines', '#ec4899', '動態島即時字幕', '切到別的 App 或鎖定螢幕時，在動態島和鎖定畫面顯示教授說的話',
           switchEl(Store.get('liveCaptions', true), v => Store.set('liveCaptions', v), '動態島即時字幕')) : null,
         row('book-open', '#10b981', '用講義校正專有名詞', '上課前先上傳講義：課名、投影片上的英文術語和之前的名詞表，會先告訴辨識引擎，人名和術語更不容易聽錯')),
-      group(Account.subscription() ? '自己的金鑰（選用）' : '進階版金鑰（開發測試用）',
+      group('裝置上的 AI（免費）', localAIRow(),
+        h('button', { class: 'row-item', style: 'width:100%;text-align:left;font:inherit;color:inherit;background:none;border:0;cursor:pointer', onclick: () => showPlans() },
+          h('span', { class: 'ri-ico', style: '--c:#9b51e0' }, icon('list-tree')), h('div', { class: 'ri-text' }, h('b', null, '哪些免費，哪些要接 API'), h('span', null, '看完整對照表')), icon('chevron-right'))),
+      group('接上 API，會更聰明',
         keyRow('audio-lines', '#5b5ce2', 'Soniox（即時字幕）', 'sonioxKey', '貼上 Soniox API key',
           ['到 ', h('a', { href: 'https://console.soniox.com', target: '_blank', rel: 'noopener' }, 'console.soniox.com'), ' 註冊並儲值後建立。']),
         keyRow('sparkles', '#d4820f', 'Anthropic（Claude 筆記）', 'anthropicKey', 'sk-ant-…',
           ['到 ', h('a', { href: 'https://console.anthropic.com', target: '_blank', rel: 'noopener' }, 'console.anthropic.com'), ' 儲值後建立，使用 Claude Opus 5.5。']),
-        colRow('list-tree', '#1f9fb3', '筆記詳細程度', '只影響進階版的 Claude 筆記',
+        colRow('list-tree', '#1f9fb3', '筆記詳細程度', '只影響 Claude 整理的筆記',
           seg([{ v: 'brief', label: '精簡' }, { v: 'standard', label: '標準' }, { v: 'detailed', label: '詳細' }], cfg.detail, v => Store.set('detail', v), 'seg full'))),
+      group('教學',
+        row('book-open', '#8b5cf6', '重看使用教學', '第一次打開時看到的滑動教學', h('button', { class: 'btn sm', onclick: () => showIntro() }, '播放'))),
       group('隱私與儲存',
         row('shield-check', '#1f9d55', '資料只存在這台裝置', '錄音、逐字稿、講義、筆記和金鑰都不會上傳到這個網站，也不會同步到其他裝置。'),
         h('div', { class: 'row-item col' },
@@ -2990,6 +3354,35 @@ async function renderSettings() {
           h('div', { class: 'meter' }, h('i', { style: `width:${usagePct}%` })))),
       h('p', { class: 'muted small', style: 'text-align:center;margin:28px 0 0' }, '蛤說啥 Say What? · 圖示來自 Lucide'))));
   afterRender();
+}
+
+// Settings row for the browser's own AI model: shows whether this device has it, and downloads it when it can.
+function localAIRow() {
+  const desc = h('span', null, '檢查中…');
+  const ctl = h('div', null);
+  const el = h('div', { class: 'row-item' }, h('span', { class: 'ri-ico', style: '--c:#14b8a6' }, icon('cpu')),
+    h('div', { class: 'ri-text' }, h('b', null, '用裝置上的 AI 回答助教問題'), desc), ctl);
+  const paint = async () => {
+    const st = await LocalAI.status();
+    if (st === 'available') {
+      desc.textContent = '這台裝置已經有 Chrome 內建的 AI 模型。不用金鑰、不用網路，內容不會離開裝置。';
+      ctl.replaceChildren(switchEl(Store.get('localAI', true), v => Store.set('localAI', v), '裝置上的 AI'));
+    } else if (st === 'downloadable' || st === 'downloading') {
+      desc.textContent = '這個瀏覽器支援內建 AI，但模型還沒下載（約 2–4 GB，只需要一次，建議用 Wi-Fi）。';
+      const b = h('button', { class: 'btn sm', onclick: async () => {
+        b.disabled = true;
+        try { await LocalAI.download(p => { b.textContent = `下載中 ${Math.round(p * 100)}%`; }); toast('裝置上的 AI 已經準備好', { icon: 'check' }); }
+        catch (e) { console.error(e); toast('下載失敗，稍後再試一次', { icon: 'info' }); }
+        b.disabled = false; paint();
+      } }, st === 'downloading' ? '下載中…' : '下載');
+      ctl.replaceChildren(b);
+    } else {
+      desc.textContent = '這個瀏覽器沒有內建 AI（目前只有較新的電腦版 Chrome 有）。助教會改用搜尋，幫你找出相關片段。';
+      ctl.replaceChildren();
+    }
+  };
+  paint();
+  return el;
 }
 
 /* ================= router ================= */
@@ -3048,6 +3441,7 @@ async function render() {
   else await renderHome();
 }
 window.addEventListener('hashchange', route);
+Account.watchAccount(() => { if (!document.querySelector('dialog[open]')) render(); });
 let wasWide = matchMedia('(min-width: 900px)').matches;
 window.addEventListener('resize', () => {
   const wide = matchMedia('(min-width: 900px)').matches;
@@ -3071,10 +3465,10 @@ applyAppearance();
 renderJellyBlobs();
 renderDoodles();
 setupRefraction();
-window.__lectureNotes = { state, Recorder, render, buildFreeNotes, player, renderPlayer, bloom, calendarSheet, notesDocHTML, shareSheet, speechVocab };
+window.__lectureNotes = { state, Recorder, outlinePDF, BrowserSTT, MicCapture, LocalAI, render, buildFreeNotes, player, renderPlayer, bloom, calendarSheet, notesDocHTML, shareSheet, speechVocab };
 // Launch animation lives in index.html so it shows on the very first frame; take it away once it has played.
 const splash = document.getElementById('splash');
 const splashMs = splash && getComputedStyle(splash).display !== 'none' && motionOn() ? 2050 : 0;
 if (splash) setTimeout(() => splash.classList.add('gone'), splashMs || 0);
 if (splashMs) setTimeout(() => buzz('soft'), 380);
-route().then(() => { if (!Store.get('plan', null) || !Store.get('onboarded', false)) setTimeout(() => showPlans({ first: true }), splashMs ? 1700 : 350); });
+route().then(() => { if (!Store.get('onboarded', false)) setTimeout(showIntro, splashMs ? 1500 : 200); });
