@@ -294,14 +294,15 @@ export function buildFreeNotes({ sentencesIn, slidesText, title, professorId, fm
     todo,
     summary: top.length ? joinSide(top) : side(''),
   };
-  notes.quiz = buildQuiz(notes);
+  notes.quiz = buildQuiz(notes, { slides: slideLines });
   return notes;
 }
 
 // Walks every {zh, en} pair in the notes and fills the empty side with translate().
 // Multiple-choice and fill-in-the-blank questions made from finished notes (also used for notes saved before quizzes existed).
 // Kept from being trivial: choices are told apart by their descriptions, and blanks are cut out of the professor's own key sentences.
-export function buildQuiz(n) {
+// Questions come from what was said in class (terms, emphasised points) and, when given, the lines of the uploaded handouts.
+export function buildQuiz(n, { slides = [] } = {}) {
   const terms = (n.key_terms || []).map(t => ({ name: t.term_zh || t.term_en, alt: t.term_zh && t.term_en ? t.term_en : '', def: t.definition || {}, t }))
     .filter(x => x.name && (x.def.zh || x.def.en));
   const defText = x => x.def.zh || x.def.en;
@@ -344,19 +345,30 @@ export function buildQuiz(n) {
   const sentences = [...(n.exam_focus || []).map(e => e.point), ...(n.outline || []).flatMap(o => (o.points || []).filter(p => p.emphasis).map(p => p.text)),
     ...(n.outline || []).flatMap(o => (o.points || []).slice(0, 2).map(p => p.text))];
   const used = new Set();
-  for (const sen of sentences) {
-    if (blank.length >= 6) break;
-    const txt = (sen && (sen.zh || sen.en)) || '';
-    if (txt.length < 10 || used.has(txt)) continue;
-    const hit = terms.map(x => [x, [x.t.term_zh, x.t.term_en].filter(Boolean).find(w => txt.includes(w))]).find(([x, w]) => w && !used.has(x.name));
-    if (!hit) continue;
-    const [x, w] = hit;
-    used.add(txt); used.add(x.name);
-    const cut = txt.replace(w, '＿＿＿＿').replace(/＿＿＿＿\s*[（(][^）)]*[）)]/, '＿＿＿＿');
-    if (cut.replace(/[＿\s，。,.]/g, '').length < 8) continue;
-    blank.push({ type: 'blank', question: sen.zh ? { zh: cut, en: '' } : { zh: '', en: cut }, options: [], answer_index: -1,
+  const asked = new Map();                       // how often a term is already the answer of a blank
+  const tryBlank = (txt, zh) => {
+    txt = (txt || '').trim();
+    if (blank.length >= 6 || txt.length < 10 || txt.length > 140 || used.has(txt)) return;
+    // Prefer a term that has not been asked yet; a term may be the answer of at most two blanks.
+    const hits = terms.map(x => [x, [x.t.term_zh, x.t.term_en].filter(Boolean).find(w => txt.includes(w))]).filter(([x, w]) => w && (asked.get(x.name) || 0) < 2)
+      .sort((p, q) => (asked.get(p[0].name) || 0) - (asked.get(q[0].name) || 0));
+    if (!hits.length) return;
+    const [x, w] = hits[0];
+    // Blank the term, and drop its other-language name too: left in, it would give the answer away.
+    let cut = txt.replace(w, '＿＿＿＿');
+    for (const v of [x.t.term_zh, x.t.term_en].filter(v => v && v !== w)) cut = cut.split(v).join('');
+    cut = cut.replace(/[（(]\s*[）)]/g, '').replace(/＿＿＿＿\s+/, '＿＿＿＿ ').replace(/\s{2,}/g, ' ').trim();
+    if (cut.replace(/[＿\s，。,.]/g, '').length < 8) return;
+    used.add(txt); asked.set(x.name, (asked.get(x.name) || 0) + 1);
+    blank.push({ type: 'blank', question: zh ? { zh: cut, en: '' } : { zh: '', en: cut }, options: [], answer_index: -1,
       answer: { zh: x.t.term_zh || '', en: x.t.term_en || '' }, explanation: x.def });
-  }
+  };
+  const isZh = t => /[\u4e00-\u9fff]/.test(t);
+  for (const sen of sentences) tryBlank(sen && (sen.zh || sen.en), !!(sen && sen.zh));
+  // Not enough yet: the rest of what was said, then the handout lines, then the definitions themselves.
+  for (const o of n.outline || []) for (const pt of o.points || []) tryBlank(pt.text && (pt.text.zh || pt.text.en), !!(pt.text && pt.text.zh));
+  for (const line of slides) tryBlank(line, isZh(line));
+  for (const x of terms.filter(defining)) tryBlank(defText(x), !!x.def.zh);
   const out = [];
   for (let i = 0; i < Math.max(choice.length, blank.length); i++) { if (choice[i]) out.push(choice[i]); if (blank[i]) out.push(blank[i]); }
   return out.slice(0, 10);

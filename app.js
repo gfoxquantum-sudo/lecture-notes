@@ -87,10 +87,57 @@ const courseColor = name => `hsl(${hashHue(name || '未分類')} 58% 50%)`;
 /* ================= appearance ================= */
 const darkMql = matchMedia('(prefers-color-scheme: dark)');
 const resolvedTheme = () => { const t = Store.get('theme', 'system'); return t === 'system' ? (darkMql.matches ? 'dark' : 'light') : t; };
+// Theme colours, in the spirit of the iPhone palette: [key, label, light, light 2nd, dark, dark 2nd].
+const ACCENTS = [
+  ['violet', '紫羅蘭', '#9b51e0', '#e45dbf', '#c08cff', '#ff8ad8'],
+  ['rose', '紅', '#e5484d', '#ff8a3d', '#ff6b6b', '#ffab70'],
+  ['amber', '橙', '#e07b00', '#ef4f6b', '#ffa733', '#ff7a8f'],
+  ['yellow', '黃', '#c99700', '#f08a00', '#ffd60a', '#ffa733'],
+  ['emerald', '綠', '#1f9d55', '#14b8a6', '#3ddc84', '#2dd4bf'],
+  ['mint', '薄荷', '#0aa89a', '#34c759', '#63e6e2', '#5fe08a'],
+  ['teal', '青', '#1a93ad', '#3aa8f5', '#40c8e0', '#70d7ff'],
+  ['ocean', '藍', '#0a7aff', '#22c3d6', '#4da3ff', '#5ee2f0'],
+  ['indigo', '靛', '#5856d6', '#8b5cf6', '#8b8cff', '#b794ff'],
+  ['pink', '粉紅', '#e8336d', '#ff8a3d', '#ff6b93', '#ffab70'],
+  ['brown', '棕', '#9a7648', '#d4820f', '#c9a577', '#f0b45e'],
+  ['graphite', '石墨', '#5f6368', '#8e8e93', '#a8adb5', '#c7c7cc'],
+];
+const hexToHsl = hex => {
+  const n = parseInt(hex.slice(1), 16), r = (n >> 16 & 255) / 255, g = (n >> 8 & 255) / 255, b = (n & 255) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), l = (max + min) / 2, d = max - min;
+  if (!d) return [0, 0, l * 100];
+  const s = d / (1 - Math.abs(2 * l - 1));
+  const hh = max === r ? ((g - b) / d + 6) % 6 : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  return [hh * 60, s * 100, l * 100];
+};
+const hsl = (hh, s, l) => `hsl(${Math.round((hh % 360 + 360) % 360)} ${Math.round(s)}% ${Math.round(l)}%)`;
+// A pair of colours from one hue: readable on a light page, brighter on a dark one.
+const fromHue = (hh, sat, dark) => (dark ? [hsl(hh, Math.min(95, sat + 18), 70), hsl(hh + 38, Math.min(95, sat + 18), 72)] : [hsl(hh, sat, 46), hsl(hh + 38, Math.min(90, sat + 8), 54)]);
+// 自動: the colour follows the course you are in; on the home page it keeps the last course's colour.
+function autoHue() {
+  const lec = state.lecture;
+  if (lec) { const hh = hashHue(lec.course || '未分類'); Store.set('autoHue', hh); return hh; }
+  return Store.get('autoHue', 268);
+}
+function accentColors(dark) {
+  const k = Store.get('accent', 'violet');
+  if (k === 'auto') return fromHue(autoHue(), 62, dark);
+  if (k === 'custom') {
+    const [hh, s, l] = hexToHsl(Store.get('accentCustom', '#9b51e0'));
+    if (s < 8) return dark ? [hsl(hh, 0, 72), hsl(hh, 0, 82)] : [hsl(hh, 0, Math.min(l, 42)), hsl(hh, 0, 58)];   // greys stay grey
+    // Keep the chosen colour, only pulled into a range that stays readable.
+    return dark ? [hsl(hh, Math.max(s, 60), Math.max(66, Math.min(l + 18, 76))), hsl(hh + 38, Math.max(s, 60), 72)]
+      : [hsl(hh, s, Math.max(30, Math.min(l, 50))), hsl(hh + 38, s, 54)];
+  }
+  const a = ACCENTS.find(x => x[0] === k) || ACCENTS[0];
+  return dark ? [a[4], a[5]] : [a[2], a[3]];
+}
 function applyAppearance() {
   const r = document.documentElement;
   r.dataset.theme = resolvedTheme();
+  const [a1, a2] = accentColors(r.dataset.theme === 'dark');
   r.dataset.accent = Store.get('accent', 'violet');
+  r.style.setProperty('--accent', a1); r.style.setProperty('--accent-2', a2);
   r.dataset.motion = Store.get('motion', true) ? 'on' : 'off';
   const meta = $('meta[name="theme-color"]');
   if (meta) meta.content = getComputedStyle(r).getPropertyValue('--bg').trim() || '#f5f4ef';
@@ -106,7 +153,7 @@ function setTheme(pref, ev) {
   void ev;
   const root = document.documentElement;
   root.classList.add('vt-theme');
-  document.startViewTransition(() => applyAppearance()).finished.finally(() => root.classList.remove('vt-theme'));
+  document.startViewTransition(() => applyAppearance()).finished.catch(() => {}).finally(() => root.classList.remove('vt-theme'));
 }
 function themeButton() {
   return h('button', {
@@ -1455,6 +1502,69 @@ async function freeNotes(lec, files) {
   return notes;
 }
 
+// Fix what the speech recogniser misheard, using the course vocabulary, the handouts and the surrounding sentences.
+// The original wording is kept in seg.raw, so it can be put back.
+const POLISH_SCHEMA = obj({ items: arr(obj({ id: { type: 'string' }, text: { type: 'string' }, tr: { type: 'string' } })) });
+async function polishTranscript() {
+  const lec = state.lecture;
+  if (!proReady().notes) { toast('修順逐字稿需要接上 Claude API', { icon: 'sparkles' }); showPlans(); return; }
+  const todo = lec.segments.filter(s => s.text.trim() && !s.fixed);
+  if (!todo.length) { toast('逐字稿已經修順過了'); return; }
+  if (!(await ensureAIConsent())) return;
+  state.polishing = true; renderSpeakers();
+  let changed = 0;
+  try {
+    const client = await getClient();
+    const vocab = ((await speechVocab(lec).catch(() => null)) || { terms: [] }).terms.slice(0, 150);
+    const slides = (lec.files || []).map(f => f.text || '').join('\n').slice(0, 6000);
+    const system = [
+      '你是課堂逐字稿的校對員。逐字稿來自語音辨識，會有同音字、聽錯的專有名詞、斷句錯誤和中英夾雜時拼錯的英文術語。',
+      '請逐句修正，讓它讀起來通順：',
+      '1. 只修正辨識錯誤：同音或近音的錯字、聽錯的術語、明顯漏掉或多出來的字、標點。依照上下文、課程名稱、詞彙表和講義判斷講者真正說的是什麼。',
+      '2. 不要改寫、不要濃縮、不要補充講者沒說的內容，保留口語和原本的語言（中文用繁體、台灣用語；英文維持英文）。',
+      '3. 沒把握就保留原文，不要亂猜。',
+      '4. tr 欄位放這一句的翻譯：中文句子翻成英文，英文句子翻成繁體中文。',
+      '每個 id 都要回傳，順序不變。',
+      lec.course || lec.title ? `課程：${[lec.course, lec.title].filter(Boolean).join('／')}` : '',
+      vocab.length ? `這門課常出現的詞彙：${vocab.join('、')}` : '',
+      slides ? `講義節錄：\n${slides}` : '',
+    ].filter(Boolean).join('\n');
+    for (let i = 0; i < todo.length; i += 50) {
+      const batch = todo.slice(i, i + 50);
+      toast(`修順中… ${Math.min(i + 50, todo.length)}/${todo.length}`, { icon: 'sparkles', ms: 90000 });
+      const first = lec.segments.indexOf(batch[0]);
+      const before = lec.segments.slice(Math.max(0, first - 6), first).map(s => (s.lang === 'en' ? s.text : toTW(s.text)));
+      const res = await streamJSON(client, {
+        model: MODEL, max_tokens: 32000,
+        output_config: { effort: 'low', format: { type: 'json_schema', schema: POLISH_SCHEMA } },
+        system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
+        messages: [{ role: 'user', content: JSON.stringify({ 前文: before, 要校對的句子: batch.map(s => ({ id: String(s.id), text: s.lang === 'en' ? s.text : toTW(s.text) })) }) }],
+      });
+      const map = new Map(res.items.map(x => [String(x.id), x]));
+      for (const s of batch) {
+        const r = map.get(String(s.id));
+        if (!r || !r.text || !r.text.trim()) continue;
+        // A "correction" that throws away or doubles the sentence is not a correction.
+        const ratio = r.text.length / Math.max(1, s.text.length);
+        if (ratio < 0.5 || ratio > 2) { s.fixed = true; continue; }
+        if (r.text.trim() !== (s.lang === 'en' ? s.text : toTW(s.text)).trim()) { if (s.raw == null) s.raw = s.text; s.text = r.text.trim(); changed++; }
+        if (r.tr && r.tr.trim()) s.tr = r.tr.trim();
+        s.fixed = true;
+      }
+      await saveLecture(lec); rerenderTranscript();
+    }
+    toast(changed ? `修順完成，修正了 ${changed} 句` : '修順完成，沒有需要修正的地方', { icon: 'sparkles', ms: 5000 });
+  } catch (err) {
+    toast('修順失敗：' + (err.message || err), { icon: 'info', ms: 6000 });
+  } finally { state.polishing = false; renderSpeakers(); }
+}
+async function unpolishTranscript() {
+  const lec = state.lecture;
+  if (!(await confirmSheet({ icon: 'undo-2', color: '#6b7280', title: '還原成原本辨識的文字？', text: 'AI 修正過的句子會變回語音辨識當時的原文。', ok: '還原' }))) return;
+  for (const s of lec.segments) { if (s.raw != null) { s.text = s.raw; delete s.raw; } delete s.fixed; }
+  await saveLecture(lec); rerenderTranscript(); renderSpeakers();
+  toast('已還原', { icon: 'undo-2' });
+}
 async function translateTranscript() {
   const lec = state.lecture;
   const todo = lec.segments.filter(s => s.text.trim() && !(s.tr && s.tr.trim()));
@@ -1539,7 +1649,6 @@ const BRAND = {
   google: '<svg viewBox="0 0 48 48" class="brand-ico" aria-hidden="true"><path fill="#FFC107" d="M43.6 20.1H42V20H24v8h11.3C33.7 32.7 29.2 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.2 8 3l5.7-5.7C34 6.1 29.3 4 24 4 13 4 4 13 4 24s9 20 20 20 20-9 20-20c0-1.3-.1-2.6-.4-3.9z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.7 15.1 19 12 24 12c3.1 0 5.8 1.2 8 3l5.7-5.7C34 6.1 29.3 4 24 4 16.3 4 9.7 8.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35.1 26.7 36 24 36c-5.2 0-9.6-3.3-11.3-7.9l-6.5 5C9.5 39.6 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.1H42V20H24v8h11.3c-.8 2.2-2.2 4.2-4.1 5.6l6.2 5.2C37 39.2 44 34 44 24c0-1.3-.1-2.6-.4-3.9z"/></svg>',
 };
 const brandIcon = k => { const t = document.createElement('template'); t.innerHTML = BRAND[k]; return t.content.firstChild; };
-const ntd = n => 'NT$' + n.toLocaleString('en-US');
 function avatar(a, size = 36) {
   return h('span', { class: 'avatar ' + (a ? a.provider : 'guest'), style: `--sz:${size}px` },
     a && a.photo ? h('img', { class: 'av-photo', src: a.photo, alt: '', referrerpolicy: 'no-referrer', onerror: e => e.target.remove() }) : null,
@@ -1567,13 +1676,45 @@ function signInButtons(onDone, { compact = false } = {}) {
     btn('google', '用 Google 登入'));
 }
 
-function legalLinks() {
-  return h('div', { class: 'legal' },
-    h('a', { href: '#', onclick: e => { e.preventDefault(); toast('使用條款頁面會在上架前補上', { icon: 'info' }); } }, '使用條款'), ' · ',
-    h('a', { href: '#', onclick: e => { e.preventDefault(); toast('隱私權政策頁面會在上架前補上', { icon: 'info' }); } }, '隱私權政策'));
-}
 
 // "How do I make it smarter?" — there are no plans to buy: pasting your own API key is what upgrades it.
+// Plain advice on getting better captions and on what happens when you leave the page while recording.
+function showTips() {
+  const cfg = settings();
+  let dlg;
+  const li = (ic, title, text, tag) => h('li', null, h('span', { class: 'fa-ico' }, icon(ic)), h('div', null, h('b', null, title, tag || null), h('span', null, text)));
+  const away = (ic, title, text, cls, verdict) => h('li', null, h('span', { class: 'aw-ico' }, icon(ic)), h('div', null, h('b', null, title), h('span', { class: 'aw-text' }, text)), h('span', { class: 'aw-verdict ' + cls }, verdict));
+  const need = (k, name) => (cfg[k] ? h('span', { class: 'status-dot on' }, icon('check'), '已接上') : h('span', { class: 'status-dot key' }, icon('zap'), `需要 ${name} 金鑰`));
+  dlg = openDialog([
+    h('button', { class: 'btn icon ghost plans-close', 'aria-label': '關閉', onclick: () => dlg.closeDialog() }, icon('x')),
+    h('div', { class: 'cal-head' }, h('span', { class: 'sticker', style: '--sz:46px;--r:-8deg;--a:#f59e0b;--b:#ef4444;animation:none' }, icon('lightbulb')),
+      h('div', null, h('h3', { style: 'margin:0' }, '讓字幕更準的方法'), h('div', { class: 'muted small' }, '內建辨識遇到離得遠、中英夾雜、專有名詞多的課，本來就容易聽錯。'))),
+    h('div', { class: 'fa-box free' },
+      h('div', { class: 'fa-title' }, icon('gift'), '上課前，不用花錢'),
+      h('ul', { class: 'fa-list' },
+        li('book-open', '填課程名稱、先上傳講義', '講義裡的術語會交給辨識器當提示，專有名詞比較不會聽錯'),
+        li('mic', '靠近講者、麥克風朝前', '「加強收音」保持開啟（在設定的「錄音與字幕」）；坐前面一點差很多'),
+        li('monitor', '用 Chrome 或 Edge', '內建辨識在這兩個瀏覽器比 Safari 準'),
+        li('languages', '選對主要語言', '內建辨識一次只聽一種語言，在設定選「中文為主」或「英文為主」'))),
+    h('div', { class: 'fa-box api' },
+      h('div', { class: 'fa-title' }, icon('zap'), '接上金鑰才有'),
+      h('ul', { class: 'fa-list' },
+        li('sparkles', '下課後「修順逐字稿」', '錄完後按逐字稿上方的按鈕，AI 會依課名、講義和前後文修正聽錯的字和術語，並補上翻譯。只修錯字不改寫，按「還原」可以變回原文。修順後再整理筆記會更準', need('anthropicKey', 'Claude')),
+        li('captions', '上課當下就準', '專門處理中英夾雜的辨識，還能分辨教授和同學。這是差別最大的一步', need('sonioxKey', 'Soniox')))),
+    h('div', { class: 'fa-box' },
+      h('div', { class: 'fa-title' }, icon('smartphone'), '錄音時可以切到別的地方嗎？'),
+      h('ul', { class: 'away-list' },
+        away('monitor', '電腦', '切到別的分頁或視窗都會繼續錄。不要關掉這個分頁，也不要讓電腦睡眠', 'yes', '會繼續錄'),
+        away('notebook-pen', 'iPad 分割畫面', '把瀏覽器和 GoodNotes 並排（分割顯示或側拉），兩邊都在畫面上就會繼續錄', 'maybe', '先試錄一次'),
+        away('smartphone', 'iPhone／iPad 切到別的 App', '離開的那段不會錄到；回來後會自動接續', 'no', '會暫停'),
+        away('lock', '鎖定螢幕', '手機和平板鎖螢幕後網頁會被暫停。錄音時 App 會讓螢幕保持亮著', 'no', '會暫停')),
+      h('p', { class: 'away-note' }, '這是手機和平板對網頁的限制，不是設定可以改的。錄音時讓這個畫面留在前面、接上電源最保險。')),
+    h('div', { class: 'cal-actions' },
+      !(cfg.anthropicKey && cfg.sonioxKey) ? h('button', { class: 'btn primary lg block', onclick: () => { dlg.closeDialog(); go('#/settings'); setTimeout(() => document.querySelector('.key-field')?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 500); } }, icon('zap'), '去貼上金鑰') : null,
+      h('button', { class: 'btn ghost block', onclick: () => dlg.closeDialog() }, '知道了')),
+  ], { cls: 'sheet smart-sheet' });
+  return dlg;
+}
 function showPlans() {
   const cfg = settings();
   let dlg;
@@ -1603,6 +1744,7 @@ function showPlans() {
         li('captions', '中英混講也聽得懂', '需要 Soniox：同一句裡中英文夾雜、口音和專有名詞更準', on('sonioxKey')),
         li('languages', '每句同步翻譯（所有瀏覽器）', '需要 Soniox：手機和 Safari 也有逐句翻譯', on('sonioxKey')),
         li('list-tree', '真正讀懂整堂課的筆記', '需要 Claude：重新組織內容、補上因果和比較表格，不是只挑句子', on('anthropicKey')),
+        li('sparkles', '修順逐字稿', '需要 Claude：下課後修正聽錯的字和術語，並補上翻譯；修順後整理的筆記也更準', on('anthropicKey')),
         li('brain', '期中考等級的測驗', '需要 Claude：考應用和推論，錯誤選項像真的誤解', on('anthropicKey')),
         li('message-circle', '讀過整堂課和講義的助教', '需要 Claude：能跨段落整理、解釋沒聽懂的觀念', on('anthropicKey')))),
     h('p', { class: 'muted small', style: 'margin:12px 0 0' }, icon('lock'), ' 金鑰只存在這台裝置。API 的費用由 Anthropic／Soniox 依用量直接向你收取。'),
@@ -2161,7 +2303,8 @@ function renderRecorder(tickOnly) {
     h('div', { class: 'rec-info' },
       h('div', { class: 'rec-time' }, fmtTime(elapsed)),
       h('div', { class: 'rec-status' }, st === 'recording' ? h('span', { class: 'live-dot' }) : null, statusTxt, engine),
-      st === 'idle' ? h('div', { class: 'rec-hint' }, icon('battery-charging'), NATIVE ? '可錄 4 小時以上，切到別的 App 或鎖定螢幕也會繼續錄' : isIOS ? '可錄 4 小時以上。iPhone 切到別的 App 時會暫停收音，回來會自動接續' : '可錄 4 小時以上，切到別的 App 也會繼續錄；記得插電') : null,
+      st === 'idle' ? h('div', { class: 'rec-hint' }, icon('battery-charging'), NATIVE ? '可錄 4 小時以上，切到別的 App 或鎖定螢幕也會繼續錄' : isIOS ? '可錄 4 小時以上。iPhone 切到別的 App 時會暫停收音，回來會自動接續' : '可錄 4 小時以上，切到別的 App 也會繼續錄；記得插電',
+        h('button', { class: 'rec-tips', onclick: showTips }, icon('lightbulb'), '字幕不準？')) : null,
       st !== 'idle' ? h('canvas', { class: 'wave', id: 'wave' }) : null),
     st === 'recording' || st === 'paused' ? h('div', { class: 'rec-side' },
       h('button', { class: 'btn icon', 'aria-label': '結束錄音', title: '結束錄音', onclick: () => r.stop() }, icon('square'))) : null].filter(Boolean));
@@ -2285,6 +2428,13 @@ function renderSpeakers() {
   if (ids.length && canTranslate && !state.rec && lec.segments.some(s => !s.tr)) {
     kids.push(h('button', { class: 'btn sm soft', disabled: state.translating, onclick: translateTranscript, title: '把沒有翻譯的句子補上' },
       icon('languages'), state.translating ? '翻譯中…' : '補齊翻譯'));
+  }
+  if (lec.segments.length && !state.rec) {
+    if (lec.segments.some(s => s.text.trim() && !s.fixed)) {
+      kids.push(h('button', { class: 'btn sm soft', disabled: !!state.polishing, onclick: polishTranscript, title: '用 AI 修正聽錯的字和術語，並補上翻譯' },
+        icon('sparkles'), state.polishing ? '修順中…' : '修順逐字稿'));
+    }
+    if (!state.polishing && lec.segments.some(s => s.raw != null)) kids.push(h('button', { class: 'btn sm ghost', onclick: unpolishTranscript, title: '變回語音辨識當時的原文' }, icon('undo-2'), '還原'));
   }
   box.replaceChildren(...kids);
 }
@@ -2719,7 +2869,10 @@ function noteSection(tab, n) {
           : h('button', { class: 'cal-btn', onclick: () => calendarSheet(o) }, icon('calendar-plus'), '加入行事曆'))))) : null,
     ];
     case 'outline': return n.outline.length ? outlineNotes(n) : emptyNote('沒有足夠的內容建立大綱筆記。');
-    case 'mindmap': return n.mind_map.branches.length ? mindMapPanel(n.mind_map) : emptyNote('沒有足夠的內容建立心智圖。');
+    case 'mindmap': return n.mind_map.branches.length ? h('div', null,
+      h('div', { class: 'mm-export' }, h('span', { class: 'muted small' }, '一頁橫式 PDF，可以在 GoodNotes 上面圈、畫、補充'),
+        h('button', { class: 'btn sm gn-btn', onclick: exportMindMapGoodNotes }, icon('notebook-pen'), '匯出到 GoodNotes')),
+      mindMapPanel(n.mind_map)) : emptyNote('沒有足夠的內容建立心智圖。');
     case 'tables': return [
       n.key_terms.length ? sec('專有名詞', 'languages', h('div', { class: 'tbl-wrap' }, h('table', null,
         h('thead', null, h('tr', null, h('th', null, 'English'), h('th', null, '中文'), h('th', null, state.lang === 'en' ? 'Definition' : '說明'))),
@@ -2956,6 +3109,10 @@ function quizView(n) {
       h('div', { class: 'grow' }, h('div', { class: 'muted small' }, `選擇題 ${nC} 題・填充題 ${qs.length - nC} 題`), h('div', { class: 'meter' }, bar)),
       h('div', { class: 'qz-score' }, '答對 ', score, ' ／ 已答 ', done),
       h('button', { class: 'btn sm', onclick: paint }, icon('refresh-cw'), '重新作答')),
+    n.engine === 'claude'
+      ? h('p', { class: 'qz-source' }, icon('sparkles'), h('span', null, '這份題目由 Claude 讀完整堂課和講義後出的，考的是理解和應用。'))
+      : h('p', { class: 'qz-source' }, icon('info'), h('span', null, '這份題目是從這堂課的錄音內容和上傳的講義直接挑出來的。接上 Claude 金鑰後重新整理筆記，題目會更好：考理解和應用，錯的選項也更像真的。 ',
+        h('button', { class: 'linklike', onclick: showPlans }, '看要怎麼接'))),
     box];
 }
 const emptyNote = t => h('div', { class: 'empty', style: 'padding:30px 10px' }, h('p', null, t));
@@ -3038,8 +3195,14 @@ async function sendFileToApp(name, blob, onPart) {
   return name;
 }
 function busyToast(text) {
-  const t = toast(text, { icon: 'refresh-cw', ms: 120000 });
-  return { set: s => { const el = document.querySelector('.toast:last-child span'); if (el) el.textContent = s; }, done: () => { document.querySelectorAll('.toast').forEach(x => x.textContent.startsWith(text.slice(0, 4)) && x.remove()); void t; } };
+  toast(text, { icon: 'refresh-cw', ms: 120000 });
+  const el = () => document.querySelector('#toast span');
+  let last = text;
+  return {
+    set: t => { const e = el(); if (e && e.textContent === last) { e.textContent = t; last = t; } },
+    // Only take the toast down if it is still ours (another message may have replaced it).
+    done: () => { const e = el(); if (e && e.textContent === last) { clearTimeout(toast._t); $('#toast').classList.remove('show'); } },
+  };
 }
 // ---- 大綱筆記 → a real PDF file, handed straight to GoodNotes through the share sheet ----
 const loadScript = src => new Promise((res, rej) => {
@@ -3085,18 +3248,66 @@ async function outlinePDF(lec, onStep) {
       if (i) pdf.addPage();
       pdf.addImage(canvas.toDataURL('image/jpeg', 0.92), 'JPEG', 0, 0, 595.28, 841.89, undefined, 'FAST');
     }
-    return { blob: pdf.output('blob'), pages: pages.length };
+    let extra = 0;
+    if (n.mind_map && n.mind_map.branches && n.mind_map.branches.length) {
+      try {
+        onStep && onStep(pages.length + 1, pages.length + 1);
+        const mm = await mindMapPage(lec);
+        pdf.addPage([mm.wPt, mm.hPt], 'landscape');
+        pdf.addImage(mm.canvas.toDataURL('image/jpeg', 0.93), 'JPEG', 0, 0, mm.wPt, mm.hPt, undefined, 'FAST');
+        extra = 1;
+      } catch (e) { console.warn('mind map page skipped', e); }
+    }
+    return { blob: pdf.output('blob'), pages: pages.length + extra };
   } finally { root.remove(); }
 }
-async function exportOutlineGoodNotes() {
-  const lec = state.lecture; if (!lec || !lec.notes) return;
-  sfx('tap');
-  const b = busyToast('正在把大綱筆記排成 PDF…');
-  let out;
-  try { out = await outlinePDF(lec, (i, nPages) => b.set(`正在排版第 ${i}／${nPages} 頁…`)); }
-  catch (e) { console.error(e); b.done(); toast('匯出失敗：' + (e.message || e), { icon: 'info', ms: 5000 }); return; }
-  b.done();
-  const name = `${safeName(lec.notes.title.zh || lec.title)}-大綱筆記.pdf`;
+// The mind map as one landscape page. A big map gets a bigger page instead of tiny text; GoodNotes zooms it like any page.
+const hexMix = (hex, pct) => { const n = parseInt(hex.replace('#', ''), 16); const c = [n >> 16 & 255, n >> 8 & 255, n & 255].map(v => Math.round(v * pct + 255 * (1 - pct))); return `rgb(${c.join(',')})`; };
+const MM_PDF_CSS = `
+.mmpdf { position: fixed; left: -30000px; top: 0; background: #fff; color: #1f1b2e; font-family: -apple-system, "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", sans-serif; box-sizing: border-box; display: flex; flex-direction: column; }
+.mmpdf * { box-sizing: border-box; }
+.mmpdf .mp-head { display: flex; align-items: baseline; gap: 14px; border-bottom: 2px solid #8b5cf6; padding-bottom: 10px; }
+.mmpdf .mp-head h1 { margin: 0; font-size: 24px; font-weight: 800; }
+.mmpdf .mp-head span { font-size: 13px; color: #6b6780; }
+.mmpdf .mp-head em { margin-left: auto; font-style: normal; font-size: 12px; font-weight: 700; color: #8b5cf6; letter-spacing: .08em; }
+.mmpdf .mp-map { flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+.mmpdf .mmx-l0 { box-shadow: none !important; background: #8b5cf6 !important; color: #fff !important; }
+.mmpdf .mmx-l1 { box-shadow: none !important; background: var(--c) !important; color: #fff !important; }
+.mmpdf .mmx-l2 { box-shadow: none !important; background: #fff !important; color: #1f1b2e !important; border: 1.5px solid var(--cl) !important; border-left: 4px solid var(--c) !important; }
+.mmpdf .mmx-l3 { color: #3b3650 !important; }
+.mmpdf .mmx-chip { background: var(--cbg) !important; color: #3b3650 !important; border: 1px solid var(--cl) !important; }
+`;
+async function mindMapPage(lec) {
+  const n = lec.notes;
+  await loadScript('https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js');
+  const html = staticMindMapHTML(n.mind_map, mmText, 1e6, 0);            // natural size, no scaling
+  const [, w, hh] = html.match(/width:(\d+)px;height:(\d+)px/).map(Number);
+  const PADX = 44, HEAD = 64, PADY = 34;
+  const fit = Math.min((1123 - PADX * 2) / w, (794 - HEAD - PADY * 2) / hh);
+  const grow = Math.min(2, Math.max(1, 0.72 / fit));                      // enlarge the page rather than shrink text below ~72%
+  const PW = Math.round(1123 * grow), PH = Math.round(794 * grow);
+  const k = Math.min(1.5, (PW - PADX * 2) / w, (PH - HEAD - PADY * 2) / hh);
+  const root = h('div', { class: 'mmpdf', style: `width:${PW}px;height:${PH}px;padding:${PADY}px ${PADX}px` });
+  root.innerHTML = `<style>${MM_PDF_CSS}</style><div class="mp-head"><h1></h1><span></span><em>心智圖 MIND MAP</em></div>
+<div class="mp-map"><div style="width:${(w * k).toFixed(0)}px;height:${(hh * k).toFixed(0)}px;flex:none"><div style="width:${w}px;height:${hh}px;transform:scale(${k.toFixed(4)});transform-origin:0 0">${html}</div></div></div>`;
+  root.querySelector('h1').textContent = n.title.zh || n.title.en || lec.title;
+  root.querySelector('.mp-head span').textContent = [lec.course, fmtDate(lec.created)].filter(Boolean).join(' · ');
+  root.querySelectorAll('.mmx-n').forEach(el => { const c = el.style.getPropertyValue('--c').trim() || '#8b5cf6'; el.style.setProperty('--cl', hexMix(c, 0.45)); el.style.setProperty('--cbg', hexMix(c, 0.12)); });
+  document.body.append(root);
+  try {
+    const canvas = await window.html2canvas(root, { scale: Math.max(1.3, 2 / grow), backgroundColor: '#ffffff', logging: false, x: 0, y: 0, scrollX: 0, scrollY: 0, windowWidth: PW, windowHeight: PH });
+    return { canvas, wPt: 841.89 * grow, hPt: 595.28 * grow };
+  } finally { root.remove(); }
+}
+async function mindMapPDF(lec) {
+  await loadScript('https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js');
+  const pg = await mindMapPage(lec);
+  const pdf = new window.jspdf.jsPDF({ unit: 'pt', format: [pg.wPt, pg.hPt], orientation: 'landscape', compress: true });
+  pdf.addImage(pg.canvas.toDataURL('image/jpeg', 0.93), 'JPEG', 0, 0, pg.wPt, pg.hPt, undefined, 'FAST');
+  return { blob: pdf.output('blob'), pages: 1 };
+}
+// "PDF is ready" sheet: share straight into GoodNotes where the browser can, download otherwise.
+function pdfReadySheet(out, name) {
   const file = new File([out.blob], name, { type: 'application/pdf' });
   const canShare = !!(navigator.canShare && navigator.canShare({ files: [file] }));
   const url = URL.createObjectURL(out.blob);
@@ -3116,14 +3327,30 @@ async function exportOutlineGoodNotes() {
       h('button', { class: 'btn ghost block', onclick: () => dlg.closeDialog() }, '關閉')),
   ], { cls: 'sheet', onClose: () => setTimeout(() => URL.revokeObjectURL(url), 60000) });
 }
-async function exportGoodNotes() {
+async function exportMindMapGoodNotes() {
   const lec = state.lecture; if (!lec || !lec.notes) return;
   sfx('tap');
-  if (!NATIVE) {
-    printDocument(notesDocHTML(lec));
-    toast('在列印視窗選「儲存為 PDF」，再用 GoodNotes 打開這個 PDF', { icon: 'notebook-pen', ms: 6000 });
-    return;
-  }
+  const b = busyToast('正在把心智圖做成 PDF…');
+  let out;
+  try { out = await mindMapPDF(lec); }
+  catch (e) { console.error(e); b.done(); toast('匯出失敗：' + (e.message || e), { icon: 'info', ms: 5000 }); return; }
+  b.done();
+  pdfReadySheet(out, `${safeName(lec.notes.title.zh || lec.title)}-心智圖.pdf`);
+}
+async function exportOutlineGoodNotes() {
+  const lec = state.lecture; if (!lec || !lec.notes) return;
+  sfx('tap');
+  const b = busyToast('正在把大綱筆記排成 PDF…');
+  let out;
+  try { out = await outlinePDF(lec, (i, nPages) => b.set(`正在排版第 ${i}／${nPages} 頁…`)); }
+  catch (e) { console.error(e); b.done(); toast('匯出失敗：' + (e.message || e), { icon: 'info', ms: 5000 }); return; }
+  b.done();
+  pdfReadySheet(out, `${safeName(lec.notes.title.zh || lec.title)}-大綱筆記.pdf`);
+}
+async function exportGoodNotes() {
+  const lec = state.lecture; if (!lec || !lec.notes) return;
+  if (!NATIVE) return exportOutlineGoodNotes();   // web: a real PDF (大綱筆記 + 心智圖) through the share sheet
+  sfx('tap');
   const b = busyToast('正在排版成 PDF…');
   try {
     await native('export.clear');
@@ -3173,7 +3400,7 @@ function shareSheet() {
     h('div', { class: 'cal-head' }, h('span', { class: 'sticker', style: '--sz:46px;--r:-8deg;--a:#a78bfa;--b:#ec4899;animation:none' }, icon('share')),
       h('div', null, h('h3', { style: 'margin:0' }, '分享與匯出'), h('div', { class: 'muted small' }, lec.title))),
     h('div', { class: 'share-list' },
-      opt('notebook-pen', '#f59e0b', '#ef4444', '匯出到 GoodNotes', NATIVE ? '排版好的 A4 PDF，含心智圖和可手寫的測驗空白處' : '開啟列印，存成 PDF 後用 GoodNotes 打開', exportGoodNotes, hasNotes),
+      opt('notebook-pen', '#f59e0b', '#ef4444', '匯出到 GoodNotes', NATIVE ? '排版好的 A4 PDF，含心智圖和可手寫的測驗空白處' : '大綱筆記、手寫和心智圖做成 PDF，直接傳到 GoodNotes', exportGoodNotes, hasNotes),
       opt('users', '#8b5cf6', '#ec4899', '分享筆記＋錄音給同學', !hasNotes ? '還沒有筆記，只會分享錄音檔' : hasAudio ? (NATIVE ? 'PDF 筆記和錄音檔，用 LINE、訊息、AirDrop 傳送' : 'Markdown 筆記和錄音檔') : '這堂課沒有保存錄音，只會分享筆記', () => shareLecture({ notes: true, audio: true }), hasNotes || hasAudio),
       opt('headphones', '#06b6d4', '#3b82f6', '只分享錄音', hasAudio ? `${(lec.audioParts || []).length} 個錄音檔` : '這堂課沒有保存錄音', () => shareLecture({ notes: false, audio: true }), hasAudio),
       opt('file-text', '#10b981', '#14b8a6', '匯出 Markdown', '筆記＋逐字稿，可貼到 Notion、Obsidian', exportMarkdown, hasNotes),
@@ -3229,16 +3456,6 @@ function exportMarkdown() {
   const a = h('a', { href: URL.createObjectURL(blob), download: (lec.course ? lec.course + '-' : '') + (n.title.zh || n.title.en || lec.title).replace(/[\\/:*?"<>|]/g, '') + '.md' });
   document.body.append(a); a.click(); a.remove();
   toast('已匯出 Markdown', { icon: 'download' });
-}
-function printNotes() {
-  const n = state.lecture.notes;
-  let area = $('#print-area');
-  if (!area) { area = h('div', { id: 'print-area' }); document.body.append(area); }
-  area.replaceChildren(
-    h('h1', null, bi(n.title)), h('p', { class: 'muted' }, (state.lecture.course || '') + ' · ' + fmtDate(state.lecture.created)),
-    NOTE_TABS.map(t => h('section', null, h('h2', { style: 'margin:22px 0 10px' }, t.label), noteSection(t.v, n))));
-  area.querySelectorAll('.engine-line').forEach(e => e.remove());
-  setTimeout(() => { if (NATIVE) native('print').catch(() => {}); else window.print(); }, 50);
 }
 
 /* ---------- files pane ---------- */
@@ -3303,10 +3520,24 @@ function lectureMenu() {
 }
 
 /* ---------- settings ---------- */
-const ACCENTS = [
-  ['emerald', '#17946f', '#14b8a6', '翡翠'], ['indigo', '#5b5ce2', '#8b5cf6', '靛藍'], ['ocean', '#1b84d1', '#22c3d6', '海洋'],
-  ['violet', '#9b51e0', '#e45dbf', '紫羅蘭'], ['rose', '#e0525f', '#fb8c4a', '珊瑚'], ['amber', '#d4820f', '#ef4f6b', '琥珀'],
-];
+function accentPicker() {
+  const cur = () => Store.get('accent', 'violet');
+  const box = h('div', { class: 'swatches' });
+  const note = h('div', { class: 'swatch-note muted small' });
+  const say = () => { const k = cur(); note.textContent = k === 'auto' ? '自動：顏色會跟著你正在看的課程變化，每門課有自己的顏色。' : k === 'custom' ? '自訂：點最後一格可以再換顏色。' : (ACCENTS.find(a => a[0] === k) || ACCENTS[0])[1]; };
+  const pick = (k, el) => { Store.set('accent', k); applyAppearance(); box.querySelectorAll('.swatch').forEach(s => s.classList.toggle('on', s === el)); custom.replaceChildren(input, icon(k === 'custom' ? 'check' : 'plus')); say(); sfx('tap'); };
+  const auto = h('button', { class: 'swatch auto' + (cur() === 'auto' ? ' on' : ''), 'aria-label': '自動', title: '自動（跟著課程變色）', onclick: e => pick('auto', e.currentTarget) }, icon('check'));
+  const input = h('input', { type: 'color', value: Store.get('accentCustom', '#9b51e0'), 'aria-label': '自訂顏色', tabindex: '-1' });
+  const custom = h('label', { class: 'swatch custom' + (Store.get('accentCustom', null) ? ' has' : '') + (cur() === 'custom' ? ' on' : ''), title: '自訂顏色', style: `--a:${Store.get('accentCustom', '#9b51e0')};--b:${Store.get('accentCustom', '#9b51e0')}` }, input, icon(cur() === 'custom' ? 'check' : 'plus'));
+  const setCustom = () => { Store.set('accentCustom', input.value); custom.style.setProperty('--a', input.value); custom.style.setProperty('--b', input.value); custom.classList.add('has'); pick('custom', custom); };
+  input.addEventListener('input', setCustom);
+  input.addEventListener('click', () => { if (Store.get('accentCustom', null)) setCustom(); });
+  const dark = document.documentElement.dataset.theme === 'dark';
+  box.append(auto, ...ACCENTS.map(([k, label, a, b, da, db]) => h('button', {
+    class: 'swatch' + (cur() === k ? ' on' : ''), style: `--a:${dark ? da : a};--b:${dark ? db : b}`, 'aria-label': label, title: label, onclick: e => pick(k, e.currentTarget) }, icon('check'))), custom);
+  say();
+  return h('div', null, box, note);
+}
 async function renderSettings() {
   const cfg = settings();
   let usageTxt = '', usagePct = 0;
@@ -3353,10 +3584,7 @@ async function renderSettings() {
           seg([{ v: 'system', label: '系統', icon: 'monitor' }, { v: 'light', label: '淺色', icon: 'sun' }, { v: 'dark', label: '深色', icon: 'moon' }],
             Store.get('theme', 'system'), (v, e) => setTheme(v, e), 'seg full accent')),
         colRow('sparkles', '#ef4f6b', '主題色', null,
-          h('div', { class: 'swatches' }, ACCENTS.map(([k, a, b, label]) => h('button', {
-            class: 'swatch' + (Store.get('accent', 'violet') === k ? ' on' : ''), style: `--a:${a};--b:${b}`, 'aria-label': label, title: label,
-            onclick: e => { Store.set('accent', k); applyAppearance(); e.currentTarget.parentElement.querySelectorAll('.swatch').forEach(s => s.classList.toggle('on', s === e.currentTarget)); },
-          }, icon('check'))))),
+          accentPicker()),
         row('zap', '#f5a524', '動態效果', '果凍彈跳、3D 視差、背景流動光影', switchEl(Store.get('motion', true), v => { Store.set('motion', v); applyAppearance(); }, '動態效果')),
         row('smartphone', '#14b8a6', '傾斜手機移動光影', '玻璃上的反光會跟著手機的角度移動', switchEl(Store.get('gyro', true), async v => {
           if (v && !(await askGyro())) { toast('沒有取得動作感測權限', { icon: 'info' }); Store.set('gyro', false); renderSettings(); return; }
@@ -3377,6 +3605,7 @@ async function renderSettings() {
           seg([{ v: 'zh', label: '中文為主' }, { v: 'en', label: '英文為主' }], cfg.mainLang, v => Store.set('mainLang', v), 'seg full')),
         row('captions', '#17946f', '即時翻譯', pro ? '每句旁邊顯示另一種語言（Soniox）' : (localTranslateSupported() ? '使用瀏覽器內建翻譯（電腦版 Chrome）' : '這個瀏覽器沒有內建翻譯；接上 Soniox 可用'),
           switchEl(cfg.translate, v => Store.set('translate', v), '即時翻譯')),
+        row('lightbulb', '#f59e0b', '讓字幕更準的方法', '上課前的準備、下課後用 AI 修順逐字稿、錄音時能不能切到別的 App', h('button', { class: 'btn sm', onclick: () => showTips() }, '看提醒')),
         row('headphones', '#e07a2e', '保存錄音檔', '可以點逐字稿回放那段錄音；一小時約 15 MB', switchEl(cfg.saveAudio, v => Store.set('saveAudio', v), '保存錄音檔')),
         !NATIVE ? row('mic', '#ec4899', '加強收音（坐後排也聽得到）', '把遠處講者的聲音放大、濾掉冷氣和桌椅的低頻噪音，再交給內建辨識。只影響辨識，不影響保存的錄音',
           switchEl(Store.get('farField', true), v => Store.set('farField', v), '加強收音')) : null,
@@ -3479,7 +3708,8 @@ async function route() {
     root.classList.add('vt-nav');
     root.dataset.navDir = state.view === 'home' ? 'back' : 'fwd';
     const vt = document.startViewTransition(async () => { await render(); window.scrollTo(0, 0); });
-    vt.finished.finally(() => root.classList.remove('vt-nav'));
+    vt.finished.catch(() => {}).finally(() => root.classList.remove('vt-nav'));   // aborted when the tab is hidden: nothing to do
+    vt.ready.catch(() => {});
     try { await vt.updateCallbackDone; } catch { /* rendered anyway */ }
     return;
   }
@@ -3487,6 +3717,7 @@ async function route() {
   window.scrollTo(0, 0);
 }
 async function render() {
+  if (Store.get('accent', 'violet') === 'auto') applyAppearance();
   if (state.view === 'lecture') renderLecture();
   else if (state.view === 'settings') await renderSettings();
   else await renderHome();
@@ -3525,7 +3756,7 @@ applyAppearance();
 renderJellyBlobs();
 renderDoodles();
 setupRefraction();
-window.__lectureNotes = { Cloud, Account, DB, state, Recorder, outlinePDF, BrowserSTT, MicCapture, LocalAI, render, buildFreeNotes, player, renderPlayer, bloom, calendarSheet, notesDocHTML, shareSheet, speechVocab };
+window.__lectureNotes = { mindMapPDF, mindMapPage, polishTranscript, Cloud, Account, DB, state, Recorder, outlinePDF, BrowserSTT, MicCapture, LocalAI, render, buildFreeNotes, player, renderPlayer, bloom, calendarSheet, notesDocHTML, shareSheet, speechVocab };
 // Launch animation lives in index.html so it shows on the very first frame; take it away once it has played.
 const splash = document.getElementById('splash');
 const splashMs = splash && getComputedStyle(splash).display !== 'none' && motionOn() ? 2050 : 0;

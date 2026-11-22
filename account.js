@@ -1,7 +1,7 @@
 // Accounts. Real sign-in (Google / Apple) runs on Firebase once firebase-config.js is filled in;
 // until then sign-in is simulated on this device so the screens can be tried.
-// Later: signIn → Firebase Auth (Sign in with Apple / Google), subscribe/restore → StoreKit 2 in the iPhone app,
-// with the server checking the receipt and counting hours. Only the functions in this file need to change.
+
+
 
 import { FIREBASE } from './firebase-config.js';
 
@@ -11,27 +11,7 @@ const set = (k, v) => { try { v == null ? localStorage.removeItem(K + k) : local
 const wait = ms => new Promise(r => setTimeout(r, ms));
 
 export const REAL_AUTH = !!(FIREBASE && FIREBASE.apiKey); // real Google / Apple sign-in once firebase-config.js is filled in
-export const PREVIEW = true; // payments are still simulated
-
-// Prices are placeholders; the real ones are set in App Store Connect and shown from StoreKit.
-export const PRODUCTS = {
-  monthly: { id: 'pro.monthly', label: '月繳', price: 190, per: '月', hours: 20 },
-  yearly: { id: 'pro.yearly', label: '年繳', price: 1490, per: '年', hours: 20, perMonth: 124 },
-};
-export const yearlySaving = () => Math.round((1 - PRODUCTS.yearly.price / (PRODUCTS.monthly.price * 12)) * 100);
-
 export function account() { return get('account', null); }
-export function subscription() {
-  const a = account(), s = get('sub', null);
-  if (!a || !s || s.uid !== a.uid) return null;
-  return { ...s, active: s.renews > Date.now() || s.autoRenew };
-}
-export function usage() {
-  const s = subscription();
-  const quota = s ? PRODUCTS[s.product].hours : 0;
-  const used = (get('usedMs', 0) || 0) / 3600000;
-  return { quota, used: Math.min(used, quota), left: Math.max(0, quota - used) };
-}
 
 // ---- real sign-in (Firebase Authentication), used when firebase-config.js is filled in ----
 const FB_VER = '11.0.2';
@@ -116,20 +96,5 @@ export async function deleteAccount(beforeDelete) {
       }
     }
   } else await wait(700);
-  set('sub', null); set('usedMs', null); set('account', null);
+  set('account', null);
 }
-
-export async function subscribe(product) {
-  const a = account();
-  if (!a) throw new Error('請先登入');
-  await wait(1200);
-  const now = Date.now();
-  const len = product === 'yearly' ? 365 : 30;
-  set('sub', { uid: a.uid, product, since: now, renews: now + len * 864e5, autoRenew: true });
-  return subscription();
-}
-export async function restore() {
-  await wait(900);
-  return subscription();
-}
-export function addUsage(ms) { if (subscription()) set('usedMs', (get('usedMs', 0) || 0) + ms); }
