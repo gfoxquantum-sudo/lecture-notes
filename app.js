@@ -1756,7 +1756,7 @@ function showPlans() {
 }
 
 /* ================= first-open tour: scroll down and each feature plays like a short film ================= */
-function showIntro() {
+function showIntro({ fresh = false } = {}) {
   if (document.getElementById('intro')) return;
   const typed = (cls, text) => h('span', { class: 'ty ' + cls, style: `--n:${[...text].length}` }, text);
   const scene = {
@@ -1851,7 +1851,7 @@ function showIntro() {
     ['tutor', '複習時', '不懂的直接問助教', '助教讀過整堂課，回答會標出時間，點一下就能跳回去重聽那一段。'],
     ['smart', '不用訂閱', '想更聰明，就接上 API', '所有功能都免費。之後在設定貼上自己的金鑰，筆記和字幕會變得更準。'],
   ];
-  const firstTime = !Store.get('onboarded', false);
+  const firstTime = fresh || !Store.get('onboarded', false);   // first visit, or arriving from the introduction page
   const close = () => {
     Store.set('onboarded', true);
     root.classList.add('leaving');
@@ -3777,4 +3777,8 @@ const splash = document.getElementById('splash');
 const splashMs = splash && getComputedStyle(splash).display !== 'none' && motionOn() ? 2050 : 0;
 if (splash) setTimeout(() => splash.classList.add('gone'), splashMs || 0);
 if (splashMs) setTimeout(() => buzz('soft'), 380);
-route().then(() => { if (!Store.get('onboarded', false)) setTimeout(showIntro, splashMs ? 1500 : 200); });
+// Arriving from the introduction page (welcome.html → ./?from=welcome) counts as a fresh start: the tour and the
+// sign-in offer are shown even if this browser has seen them before. The marker is dropped so a reload does not repeat it.
+const fromWelcome = new URLSearchParams(location.search).get('from') === 'welcome';
+if (fromWelcome) history.replaceState(null, '', location.pathname + location.hash);
+route().then(() => { if (fromWelcome || !Store.get('onboarded', false)) setTimeout(() => showIntro({ fresh: fromWelcome }), splashMs ? 1500 : 200); });
