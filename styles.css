@@ -1607,3 +1607,28 @@ html[data-motion="off"] #intro *, html[data-motion="off"] #intro { animation-dur
 .swatch.custom:not(.has) svg.i { color: var(--muted); }
 .swatch.custom input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; border: 0; padding: 0; }
 .swatch-note { margin-top: 10px; min-height: 1.3em; }
+
+/* ================= home greeting: handwritten, written out stroke by stroke ================= */
+.hand-greet { font-family: "LXGW WenKai TC", "Kaiti TC", "BiauKai", "DFKai-SB", "KaiTi", cursive; font-weight: 700; letter-spacing: .05em; line-height: 1.4;
+  font-size: clamp(1.9rem, 6vw, 2.6rem); -webkit-text-stroke: .7px currentColor; paint-order: stroke fill; }
+.hand-greet span { display: inline-block; transform-origin: 30% 80%; transform: translateY(var(--y, 0)) rotate(var(--r, 0deg)); }
+.hand-greet.write span { opacity: 0; animation: handWrite .55s cubic-bezier(.2, .9, .3, 1.25) var(--d) forwards; }
+@keyframes handWrite {
+  0% { opacity: 0; clip-path: inset(0 100% 0 0); transform: translateY(8px) rotate(-9deg) scale(.8); }
+  55% { opacity: 1; clip-path: inset(-10% -10% -10% -10%); transform: translateY(-4px) rotate(3deg) scale(1.12); }
+  100% { opacity: 1; clip-path: inset(-10% -10% -10% -10%); transform: translateY(var(--y, 0)) rotate(var(--r, 0deg)); }
+}
+@media (prefers-reduced-motion: reduce) { .hand-greet.write span { animation: none; opacity: 1; } }
+
+/* ================= handwritten face on titles, so the greeting does not stand alone ================= */
+:root { --font-hand: "LXGW WenKai TC", "Kaiti TC", "BiauKai", "DFKai-SB", "KaiTi", var(--font-display); }
+h1, h2, h3, .brand, .on-head h4, .fa-title, .in-text h1, .in-text h2, .acct-top b, .signin-banner b, .mp-head h1 {
+  font-family: var(--font-hand); letter-spacing: .02em; -webkit-text-stroke: .35px currentColor; paint-order: stroke fill; }
+.brand { font-size: 1.22rem; }
+.course-head h2 { font-size: 1.12rem; }
+.card h3 { font-size: 1.14rem; }
+.note-sec > h3 { font-size: 1.1rem; }
+.on-head h4 { font-size: 1.2rem; }
+dialog h3 { font-size: 1.3rem; }
+.fa-title { font-size: 1.04rem; }
+.in-text h1 { -webkit-text-stroke: 0; }

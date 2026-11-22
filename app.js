@@ -1967,6 +1967,21 @@ function accountCard() {
 /* ================= views ================= */
 const app = () => $('#app');
 
+// The home greeting, in a handwritten face, written out one character at a time the first time it shows.
+// The handwritten face is used for the greeting and for titles. Google Fonts serves it in small slices, so only the characters on screen are downloaded.
+document.head.append(Object.assign(document.createElement('link'), { id: 'hand-font', rel: 'stylesheet', href: 'https://fonts.googleapis.com/css2?family=LXGW+WenKai+TC:wght@700&display=swap' }));
+let greetShown = false;
+function handGreeting(text) {
+  const write = !greetShown && motionOn();
+  greetShown = true;
+  // Wait for the opening splash to clear, so the writing is actually seen.
+  const base = document.querySelector('#splash') ? 1700 : 350;
+  const tilt = [-2.2, 1.4, -0.8, 2, -1.6, 0.9, -1.2, 1.8, -0.6, 1.1, -1.9, 0.7], lift = [0, -1.5, 1, -0.5, 1.5, 0, -1, 0.5, 1, -1.5, 0.5, 0];
+  let i = 0;
+  return h('h1', { class: 'hand-greet' + (write ? ' write' : ''), 'aria-label': text },
+    [...text].map((ch, k) => h('span', { 'aria-hidden': 'true',
+      style: `--d:${base + (/[，？]/.test(ch) ? i += 2 : i++) * 90}ms;--r:${tilt[k % tilt.length]}deg;--y:${lift[k % lift.length]}px` }, ch)));
+}
 async function renderHome() {
   const list = (await myLectures()).sort((a, b) => b.created - a.created);
   const cfg = settings();
@@ -1987,7 +2002,7 @@ async function renderHome() {
       h('section', { class: 'hero' },
         h('div', { class: 'hero-art', 'aria-hidden': 'true' }, sticker('notebook-pen'), sticker('mic'), sticker('sparkles')),
         h('div', { class: 'hero-top' },
-          h('div', null, h('h1', null, `${greet}，準備好上課了嗎？`), h('div', { class: 'sub' }, fmtDate(Date.now())),
+          h('div', null, handGreeting(`${greet}，準備好上課了嗎？`), h('div', { class: 'sub' }, fmtDate(Date.now())),
             Account.REAL_AUTH && Account.account() ? syncLine('on-hero') : null)),
         h('div', { class: 'stats' },
           h('div', { class: 'stat' }, h('b', null, String(list.length)), h('span', null, '堂課')),
