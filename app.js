@@ -15,6 +15,8 @@ import * as Tutor from './tutor.js';
 import { mindMapView, staticMindMapHTML, MM_NODE_CSS } from './mindmap.js';
 import { notesDocument, outlineBlocks, OUTLINE_CSS } from './export-doc.js';
 import { inkPad, inkImage, hasInk } from './ink.js';
+import * as HiFi from './local-stt.js';
+import { UPDATES, latestUpdate } from './updates.js';
 
 const SDK_URL = 'https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@1.3.0/+esm';
 const OPENCC_URL = 'https://cdn.jsdelivr.net/npm/opencc-js@1.4.2/dist/esm/cn2t.js';
@@ -928,6 +930,31 @@ async function localTutor(lec, q, onText) {
     `逐字稿片段：\n${ctx}\n\n學生的問題：${q}`, onText);
 }
 
+/* ================= High-accuracy captions on this device (free, no key) ================= */
+// The browser's built-in recogniser is made for dictation close to the microphone; across a classroom it drops most of what is said.
+// This engine listens to the same microphone audio with a speech model that runs on the device.
+const hifi = { ok: !NATIVE && HiFi.supported(), has: false };
+HiFi.setSize(Store.get('hifiSize', null));
+if (hifi.ok) HiFi.capability().then(c => { if (!c.ok) { hifi.ok = false; if (typeof renderRecorder === 'function' && state.view === 'lecture' && !state.rec) renderRecorder(); } });
+const hifiOn = () => hifi.ok && hifi.has && Store.get('hifi', true);
+if (hifi.ok) HiFi.downloaded().then(v => { hifi.has = v; if (v && typeof renderRecorder === 'function' && state.view === 'lecture' && !state.rec) renderRecorder(); });
+// One long piece of dictation → caption rows of a readable length, with the time shared out by length.
+function splitCaption(text, startMs, endMs) {
+  const parts = [];
+  for (const sent of text.split(/(?<=[。！？!?])\s*|(?<=[.])\s+(?=[A-Z\u4e00-\u9fff])/u)) {
+    let rest = sent.trim();
+    while (rest.length > 70) {
+      const win = rest.slice(30, 70), m = win.search(/[，,、；; ](?!.*[，,、；; ])/u);
+      const at = m >= 0 ? 30 + m + 1 : 50;
+      parts.push(rest.slice(0, at).trim()); rest = rest.slice(at).trim();
+    }
+    if (rest) parts.push(rest);
+  }
+  const total = parts.reduce((a, x) => a + x.length, 0) || 1;
+  let t = startMs;
+  return parts.map(x => { const d = (endMs - startMs) * x.length / total; const r = { text: x, start: Math.round(t), end: Math.round(t + d) }; t += d; return r; });
+}
+
 /* ================= Recorder controller ================= */
 class Recorder {
   constructor(lec) {
@@ -1009,6 +1036,7 @@ class Recorder {
     if (NATIVE) return this.startNative(cfg);
     this.mode = proReady().stt ? 'soniox' : 'free';
     if (this.mode === 'soniox' && !(await ensureAIConsent())) this.mode = 'free';
+    if (this.mode === 'free' && hifiOn()) this.mode = 'local';
     if (this.mode === 'free' && !BrowserSTT.supported()) {
       toast('這個瀏覽器沒有內建語音辨識，請改用 Chrome 或 Safari，或到設定接上 Soniox', { icon: 'info', ms: 5000 }); return;
     }
@@ -1022,8 +1050,9 @@ class Recorder {
         keepAudio: cfg.saveAudio,
         onChunk: (blob, seq) => { DB.addChunk({ lec: this.lec.id, part: this.offset0, seq, blob }).catch(() => { /* storage full */ }); },
         onLevel: l => { this.level = l; this.levels.push(l); if (this.levels.length > 400) this.levels.splice(0, 200); },
-        onPcm: buf => { if (this.mode === 'soniox' && this.session) this.session.send(buf); },
+        onPcm: buf => { if (this.mode === 'soniox' && this.session) this.session.send(buf); else if (this.local) this.local.push(buf); },
       };
+      if (this.mode === 'local') await this.startLocal(cfg);
       this.mic = new MicCapture();
       await this.mic.start(this.micOpts);
       this.watchMic();
@@ -1035,6 +1064,17 @@ class Recorder {
           onClose: () => { if (this.status === 'recording' || this.status === 'paused') this.reconnect(); },
         });
         await this.session.start();
+      } else if (this.mode === 'local') {
+        // Chrome on a computer can also show its own instant guess while the accurate text is on its way.
+        if (BrowserSTT.supported() && !isIOS && /Chrome\//.test(navigator.userAgent)) {
+          this.browser = new BrowserSTT({
+            lang: cfg.mainLang === 'en' ? 'en-US' : 'zh-TW',
+            onFinal: text => { this.pv = ((this.pv || '') + text).slice(-80); this.localNote(); },
+            onInterim: text => { this.pvNow = text; this.localNote(); },
+            onError: () => { /* the preview is optional */ },
+          });
+          this.browser.start();
+        }
       } else {
         const vocab = (await speechVocab(this.lec).catch(() => null) || {}).terms || [];
         this.browser = new BrowserSTT({
@@ -1062,6 +1102,42 @@ class Recorder {
     this.keeper = setInterval(() => { if (this.status === 'paused' && this.session) this.session.keepalive(); }, 8000);
     requestWakeLock();
     renderRecorder();
+  }
+  async startLocal(cfg) {
+    const v = (await speechVocab(this.lec).catch(() => null)) || {};
+    this.localBase = this.offset0;
+    this.local = new HiFi.LocalSTT({
+      lang: cfg.mainLang === 'en' ? 'en' : 'zh', vocab: v.terms || [], course: this.lec.course || '',
+      slides: (this.lec.files || []).map(f => f.text || '').join('\n'),
+      onSegment: (text, s, e) => {
+        this.pv = ''; this.pvNow = '';
+        for (const c of splitCaption(text, this.localBase + s, this.localBase + e)) this.addFreeSegment(c.text, c.start, c.end);
+        this.localNote();
+      },
+      onBacklog: sec => { this.backlog = sec; this.localNote(); },
+      onError: err => console.warn('local captions', err),
+    });
+    // The model takes a while to start; recording begins right away and the first captions catch up.
+    HiFi.load().catch(err => {
+      console.warn('local captions', err);
+      toast('高準確字幕這次沒能啟動。錄音照常保存，下課後可以按「重新辨識錄音」', { icon: 'info', ms: 7000 });
+      this.localDead = true; this.localNote();
+    });
+    this.localNote();
+  }
+  // The line under the transcript while the accurate text is still being written.
+  localNote() {
+    if (!this.local) return;
+    const live = ((this.pv || '') + (this.pvNow || '')).trim();
+    let text = '';
+    if (this.status === 'stopping') text = '';
+    else if (this.localDead) text = '（高準確字幕沒有啟動，錄音照常進行）';
+    else if (live) text = live + ' …';
+    else if ((this.backlog || 0) > 45) text = `正在聽寫，目前落後約 ${Math.round(this.backlog)} 秒…`;
+    else text = '正在聽寫，字幕大約晚半分鐘出現…';
+    this.nonFinal = { text, tr: '' };
+    scheduleRender();
+    if (this.status === 'stopping') renderRecorder();
   }
   // iPhone/iPad suspend a web app's microphone when you switch apps. When we come back,
   // check the microphone and, if it was cut off, start a new audio part and carry on.
@@ -1092,6 +1168,7 @@ class Recorder {
       await this.mic.start(this.micOpts);
       this.watchMic();
       if (wasPaused) this.mic.pause();
+      if (this.local) this.localBase = this.offset0 - this.local.total / 16;
       if (this.session) this.session.close(); // the close handler reconnects with the new time offset
       if (this.browser && !wasPaused) { this.browser.stop(); this.browser.start(); }
       const gap = this.hiddenAt ? Math.round((Date.now() - this.hiddenAt) / 1000) : 0;
@@ -1194,6 +1271,13 @@ class Recorder {
     this.lec.durationMs = this.elapsedBase;
     if (audio) { this.lec.audioParts = this.lec.audioParts || []; this.lec.audioParts.push({ blob: audio, offset: this.offset0 }); }
     await saveLecture(this.lec);
+    if (this.local && !this.localDead) {
+      // the recording is already safe; now write down whatever is still waiting
+      renderRecorder();
+      try { await this.local.finish(); } catch (err) { console.warn('local captions', err); }
+      this.nonFinal = { text: '', tr: '' };
+      await saveLecture(this.lec);
+    }
     if (audio) await DB.dropChunks(this.lec.id).catch(() => {});
     sfx('stop');
     this.status = 'idle';
@@ -1692,6 +1776,8 @@ function showTips() {
     h('div', { class: 'fa-box free' },
       h('div', { class: 'fa-title' }, icon('gift'), '上課前，不用花錢'),
       h('ul', { class: 'fa-list' },
+        !NATIVE && hifi.ok ? li('cpu', '開啟「高準確字幕」', hifiOn() ? '已經開啟：教授離得遠、有風扇聲、講得快或含糊也聽得出來，字幕大約晚半分鐘出現。' : '差別最大的一步。瀏覽器內建辨識隔著教室會漏掉大部分內容；到設定的「錄音與字幕」下載辨識模型（一次，約 ' + HiFi.SIZE_MB[HiFi.pickSize()] + ' MB），之後就在這台裝置上聽寫，不用金鑰。',
+          hifiOn() ? h('span', { class: 'status-dot on' }, icon('check'), '已開啟') : h('button', { class: 'btn sm primary', style: 'margin-left:8px', onclick: () => { dlg.closeDialog(); go('#/settings'); setTimeout(() => document.querySelector('.hifi-ctl')?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 400); } }, '去下載')) : null,
         li('book-open', '填課程名稱、先上傳講義', '講義裡的術語會交給辨識器當提示，專有名詞比較不會聽錯'),
         li('mic', '靠近講者、麥克風朝前', '「加強收音」保持開啟（在設定的「錄音與字幕」）；坐前面一點差很多'),
         li('monitor', '用 Chrome 或 Edge', '內建辨識在這兩個瀏覽器比 Safari 準'),
@@ -1982,6 +2068,30 @@ function handGreeting(text) {
     [...text].map((ch, k) => h('span', { 'aria-hidden': 'true',
       style: `--d:${base + (/[，？]/.test(ch) ? i += 2 : i++) * 90}ms;--r:${tilt[k % tilt.length]}deg;--y:${lift[k % lift.length]}px` }, ch)));
 }
+/* ---------- update notices ---------- */
+const unseenUpdates = () => UPDATES.filter(u => u.id > Store.get('seenUpdate', 0)).length;
+function updatesButton() {
+  const n = unseenUpdates();
+  const b = h('button', { class: 'btn icon ghost upd-btn' + (n ? ' has' : ''), 'aria-label': n ? `更新通知，有 ${n} 則新的` : '更新通知', title: '更新通知',
+    onclick: () => { showUpdates(); b.classList.remove('has'); b.setAttribute('aria-label', '更新通知'); } }, icon('bell'), h('span', { class: 'upd-dot', 'aria-hidden': 'true' }));
+  return b;
+}
+function showUpdates() {
+  const seen = Store.get('seenUpdate', 0);
+  let dlg;
+  const day = d => { const [y, m, dd] = d.split('-').map(Number); return `${y} 年 ${m} 月 ${dd} 日`; };
+  dlg = openDialog([
+    h('button', { class: 'btn icon ghost plans-close', 'aria-label': '關閉', onclick: () => dlg.closeDialog() }, icon('x')),
+    h('div', { class: 'cal-head' }, h('span', { class: 'sticker', style: '--sz:46px;--r:-8deg;--a:#8b5cf6;--b:#ec4899;animation:none' }, icon('bell')),
+      h('div', null, h('h3', { style: 'margin:0' }, '更新通知'), h('div', { class: 'muted small' }, '每次更新了什麼，都寫在這裡。'))),
+    h('div', { class: 'upd-list' }, UPDATES.map(u => h('article', { class: 'upd' + (u.id > seen ? ' new' : '') },
+      h('div', { class: 'upd-meta' }, h('span', { class: 'upd-ver' }, '第 ' + u.id + ' 版'), day(u.date), u.id > seen ? h('span', { class: 'upd-new' }, '新') : null),
+      h('h4', null, u.title),
+      h('ul', null, u.items.map(t => h('li', null, t)))))),
+  ]);
+  Store.set('seenUpdate', latestUpdate());
+}
+
 async function renderHome() {
   const list = (await myLectures()).sort((a, b) => b.created - a.created);
   const cfg = settings();
@@ -1995,6 +2105,7 @@ async function renderHome() {
       h('div', { class: 'brand grow' }, h('span', { class: 'logo orb-logo' }, icon('audio-lines')), '蛤說啥'),
       planBadge(),
       themeButton(),
+      updatesButton(),
       h('button', { class: 'btn icon ghost', 'aria-label': '設定', onclick: () => go('#/settings') }, icon('settings')),
       Account.REAL_AUTH ? h('button', { class: 'btn icon ghost avatar-btn', 'aria-label': Account.account() ? '帳號' : '登入', title: Account.account() ? Account.account().name : '登入',
         onclick: () => go('#/settings') }, avatar(Account.account(), 30)) : null),
@@ -2293,7 +2404,8 @@ function renderRecorder(tickOnly) {
   }
   box.dataset.st = st;
   const pro = proReady().stt;
-  const engine = h('span', { class: 'engine' + (pro ? ' pro' : '') }, icon(pro ? 'sparkles' : 'gift'), pro ? '進階：Soniox' : NATIVE ? '免費：iPhone 語音辨識' : '免費：瀏覽器辨識');
+  const local = !pro && (r ? r.mode === 'local' : hifiOn());
+  const engine = h('span', { class: 'engine' + (pro ? ' pro' : '') }, icon(pro ? 'sparkles' : local ? 'cpu' : 'gift'), pro ? '進階：Soniox' : NATIVE ? '免費：iPhone 語音辨識' : local ? '免費：高準確字幕' : '免費：瀏覽器辨識');
   let btn;
   if (st === 'idle') btn = h('button', { class: 'rec-btn idle', 'aria-label': '開始錄音', onclick: startRecording }, icon('mic'));
   else if (st === 'recording') btn = h('button', { class: 'rec-btn live', 'aria-label': '暫停', onclick: () => r.pause() }, icon('pause'));
@@ -2301,7 +2413,8 @@ function renderRecorder(tickOnly) {
   else btn = h('button', { class: 'rec-btn busy', disabled: true }, icon('refresh-cw'));
   const statusTxt = {
     idle: state.lecture.segments.length ? '按下紅色按鈕繼續錄音' : '按下紅色按鈕開始錄音',
-    connecting: '連線中…', recording: '錄音中', paused: '已暫停', stopping: '儲存中…',
+    connecting: '連線中…', recording: '錄音中', paused: '已暫停',
+    stopping: r && r.local && !r.localDead && (r.backlog || 0) > 1 ? `錄音已存好，還在寫最後 ${Math.ceil(r.backlog)} 秒的字幕…` : '儲存中…',
   }[st];
   box.classList.toggle('live', st === 'recording');
   const fab = $('#zone-fab');
@@ -2319,7 +2432,8 @@ function renderRecorder(tickOnly) {
       h('div', { class: 'rec-time' }, fmtTime(elapsed)),
       h('div', { class: 'rec-status' }, st === 'recording' ? h('span', { class: 'live-dot' }) : null, statusTxt, engine),
       st === 'idle' ? h('div', { class: 'rec-hint' }, icon('battery-charging'), NATIVE ? '可錄 4 小時以上，切到別的 App 或鎖定螢幕也會繼續錄' : isIOS ? '可錄 4 小時以上。iPhone 切到別的 App 時會暫停收音，回來會自動接續' : '可錄 4 小時以上，切到別的 App 也會繼續錄；記得插電',
-        h('button', { class: 'rec-tips', onclick: showTips }, icon('lightbulb'), '字幕不準？')) : null,
+        h('button', { class: 'rec-tips', onclick: showTips }, icon('lightbulb'), !pro && hifi.ok && !hifiOn() ? '字幕不準？開高準確字幕' : '字幕不準？'),
+        !NATIVE ? h('button', { class: 'rec-tips', disabled: !!state.relisten, title: '已經用別的方式錄好了？上傳錄音檔，自動變成逐字稿和筆記', onclick: pickAudioFile }, icon('upload'), state.relisten ? '辨識中…' : '上傳錄音檔') : null) : null,
       st !== 'idle' ? h('canvas', { class: 'wave', id: 'wave' }) : null),
     st === 'recording' || st === 'paused' ? h('div', { class: 'rec-side' },
       h('button', { class: 'btn icon', 'aria-label': '結束錄音', title: '結束錄音', onclick: () => r.stop() }, icon('square'))) : null].filter(Boolean));
@@ -2354,6 +2468,7 @@ function drawWave() {
 }
 async function startRecording() {
   if (state.rec) return;
+  if (state.relisten) { toast('正在辨識錄音檔，等它完成再錄音', { icon: 'info' }); return; }
   player.detach();
   state.rec = new Recorder(state.lecture);
   renderPlayer();
@@ -2451,7 +2566,104 @@ function renderSpeakers() {
     }
     if (!state.polishing && lec.segments.some(s => s.raw != null)) kids.push(h('button', { class: 'btn sm ghost', onclick: unpolishTranscript, title: '變回語音辨識當時的原文' }, icon('undo-2'), '還原'));
   }
+  if (!state.rec && hifiOn() && lec.audioParts && lec.audioParts.length) {
+    kids.push(h('button', { class: 'btn sm soft', disabled: !!state.relisten, onclick: relistenLecture, title: '用高準確字幕把保存的錄音重新聽寫一次，取代現在的逐字稿' },
+      icon('cpu'), state.relisten ? '重新辨識中…' : '重新辨識錄音'));
+    if (!state.relisten && lec.oldSegments) kids.push(h('button', { class: 'btn sm ghost', onclick: undoRelisten, title: '換回重新辨識之前的逐字稿' }, icon('undo-2'), '換回舊逐字稿'));
+  }
   box.replaceChildren(...kids);
+}
+// Make sure the on-device engine is downloaded and running. progress(text) shows what is happening.
+async function ensureHifi(progress) {
+  const prog = (a, b) => progress(`${hifi.has ? '啟動' : '下載'}辨識模型 ${Math.round(a / 1e6)} / ${Math.round(b / 1e6)} MB`);
+  await HiFi.load(prog);
+  if (!(await HiFi.downloaded()) && HiFi.pickSize() === 'large') {      // this browser cannot keep the bigger model
+    Store.set('hifiSize', 'small'); HiFi.setSize('small');
+    await HiFi.load(prog);
+  }
+  hifi.has = await HiFi.downloaded();
+  if (hifi.has && Store.get('hifi', null) == null) Store.set('hifi', true);
+}
+// One recording → caption rows, starting at `offset` ms in the lecture.
+async function hifiTranscribe(lec, blob, offset, note) {
+  const out = [];
+  const v = (await speechVocab(lec).catch(() => null)) || {};
+  const total = lec.durationMs || 0;
+  note('讀取錄音…');
+  const pcm = await HiFi.decode16k(blob);
+  const stt = new HiFi.LocalSTT({
+    lang: settings().mainLang === 'en' ? 'en' : 'zh', vocab: v.terms || [], course: lec.course || '', slides: (lec.files || []).map(f => f.text || '').join('\n'),
+    onSegment: (text, s, e) => {
+      for (const c of splitCaption(text, offset + s, offset + e)) out.push({ id: uid(), speaker: '?', start: c.start, end: c.end, lang: /[一-鿿]/.test(c.text) ? 'zh' : 'en', text: c.text, tr: '' });
+      note(`辨識中 ${fmtTime(offset + e)} / ${fmtTime(Math.max(total, offset + pcm.length / 16))}，請讓這一頁開著`);
+    },
+  });
+  for (let i = 0; i < pcm.length; i += 16000 * 30) { stt.push(pcm.subarray(i, i + 16000 * 30)); await stt.chain; }   // half a minute at a time
+  await stt.finish();
+  return { segments: out, ms: Math.round(pcm.length / 16) };
+}
+// "I already recorded the class with something else": pick an audio file, get the transcript, then the notes.
+async function pickAudioFile() {
+  if (state.rec || state.relisten) return;
+  if (hifi.ok && !(await HiFi.capability()).ok) hifi.ok = false;
+  if (!hifi.ok) { toast('上傳錄音檔需要在裝置上辨識，這個瀏覽器不支援。請用新版 Chrome 或 Edge，iPhone 和 iPad 需要 iOS 26 以上的 Safari', { icon: 'info', ms: 8000 }); return; }
+  const input = h('input', { type: 'file', accept: 'audio/*,video/mp4,.m4a,.mp3,.wav,.aac,.ogg,.webm,.mp4,.flac', class: 'hidden',
+    onchange: e => { const f = e.target.files[0]; input.remove(); if (f) importAudioFile(f); } });
+  document.body.append(input); input.click();
+}
+async function importAudioFile(file) {
+  const lec = state.lecture;
+  if (!lec || state.rec || state.relisten) return;
+  if (!hifi.has && !confirm(`要把錄音檔變成逐字稿，需要先下載辨識模型（約 ${HiFi.SIZE_MB[HiFi.pickSize()]} MB，只要一次，建議用 Wi-Fi）。現在下載嗎？`)) return;
+  if (file.size > 400 * 1024 * 1024 && !confirm('這個檔案很大，手機和平板可能會因為記憶體不夠而失敗。要繼續嗎？')) return;
+  state.relisten = lec.id; renderSpeakers(); renderRecorder();
+  const bt = busyToast('準備辨識錄音檔（一小時的課大約要 15 到 60 分鐘，請讓這一頁開著）…');
+  try {
+    await ensureHifi(t => bt.set(t));
+    const offset = lec.audioParts && lec.audioParts.length ? Math.max(lec.durationMs || 0, 0) : 0;
+    const r = await hifiTranscribe(lec, file, offset, t => bt.set(t));
+    if (!r.segments.length) { toast('這個錄音檔裡沒有聽到說話的聲音', { icon: 'info', ms: 6000 }); return; }
+    lec.audioParts = lec.audioParts || [];
+    lec.audioParts.push({ blob: file, offset });
+    lec.segments = lec.segments.concat(r.segments);
+    lec.durationMs = offset + r.ms;
+    await saveLecture(lec);
+    if (state.lecture === lec) { renderRecorder(); renderTranscriptPane(); renderRightPane(); renderPlayer(); }
+    bt.done();
+    toast('逐字稿好了，接著整理筆記', { icon: 'check', ms: 4000 });
+    state.relisten = null;
+    if (state.lecture === lec) generateNotes();
+  } catch (err) {
+    console.error(err);
+    toast('錄音檔沒有處理完：' + ((err && err.message) || err), { icon: 'info', ms: 8000 });
+  } finally { bt.done(); state.relisten = null; renderSpeakers(); if (state.lecture === lec) renderRecorder(); }
+}
+// Write the transcript again from the saved recording, with the on-device engine.
+async function relistenLecture() {
+  const lec = state.lecture;
+  if (state.relisten || state.rec || !lec.audioParts || !lec.audioParts.length) return;
+  state.relisten = lec.id; renderSpeakers();
+  const bt = busyToast('準備重新辨識錄音（一小時的課大約要 15 到 60 分鐘，請讓這一頁開著）…');
+  const out = [];
+  try {
+    await ensureHifi(t => bt.set(t));
+    for (const part of [...lec.audioParts].sort((a, b) => a.offset - b.offset)) out.push(...(await hifiTranscribe(lec, part.blob, part.offset, t => bt.set(t))).segments);
+    if (!out.length) { toast('錄音裡沒有聽到說話的聲音', { icon: 'info', ms: 5000 }); return; }
+    lec.oldSegments = lec.segments;
+    lec.segments = out;
+    await saveLecture(lec);
+    if (state.lecture === lec) { renderTranscriptPane(); renderRightPane(); }
+    toast(lec.notes ? '逐字稿已經重新聽寫。筆記是用舊逐字稿做的，可以重新整理一次' : '逐字稿已經重新聽寫', { icon: 'check', ms: 7000 });
+  } catch (err) {
+    console.error(err);
+    toast('重新辨識沒有完成：' + ((err && err.message) || err), { icon: 'info', ms: 7000 });
+  } finally { bt.done(); state.relisten = null; renderSpeakers(); }
+}
+async function undoRelisten() {
+  const lec = state.lecture; if (!lec.oldSegments) return;
+  lec.segments = lec.oldSegments; delete lec.oldSegments;
+  await saveLecture(lec); renderTranscriptPane(); renderRightPane();
+  toast('已換回舊的逐字稿', { icon: 'undo-2' });
 }
 function speakerDialog(id) {
   const lec = state.lecture;
@@ -3622,6 +3834,7 @@ async function renderSettings() {
           switchEl(cfg.translate, v => Store.set('translate', v), '即時翻譯')),
         row('lightbulb', '#f59e0b', '讓字幕更準的方法', '上課前的準備、下課後用 AI 修順逐字稿、錄音時能不能切到別的 App', h('button', { class: 'btn sm', onclick: () => showTips() }, '看提醒')),
         row('headphones', '#e07a2e', '保存錄音檔', '可以點逐字稿回放那段錄音；一小時約 15 MB', switchEl(cfg.saveAudio, v => Store.set('saveAudio', v), '保存錄音檔')),
+        !NATIVE ? hifiRow() : null,
         !NATIVE ? row('mic', '#ec4899', '加強收音（坐後排也聽得到）', '把遠處講者的聲音放大、濾掉冷氣和桌椅的低頻噪音，再交給內建辨識。只影響辨識，不影響保存的錄音',
           switchEl(Store.get('farField', true), v => Store.set('farField', v), '加強收音')) : null,
         NATIVE ? row('sparkles', '#8b5cf6', '辨識更準確', '有網路時交給 Apple 伺服器辨識，比手機上辨識準；關閉則完全在手機上處理',
@@ -3652,6 +3865,58 @@ async function renderSettings() {
 }
 
 // Settings row for the browser's own AI model: shows whether this device has it, and downloads it when it can.
+function hifiRow() {
+  const desc = h('span', null, '');
+  const ctl = h('div', { class: 'hifi-ctl' });
+  const size = h('div', { class: 'hifi-size' });
+  const el = h('div', { class: 'row-item hifi-row' }, h('span', { class: 'ri-ico', style: '--c:#0ea5e9' }, icon('cpu')),
+    h('div', { class: 'ri-text' }, h('b', null, '高準確字幕（免費，在這台裝置上辨識）'), desc, size), ctl);
+  const pick = async v => { Store.set('hifiSize', v); HiFi.setSize(v); hifi.has = await HiFi.downloaded(); paint(); };
+  const paint = () => {
+    const mb = HiFi.SIZE_MB[HiFi.pickSize()];
+    if (!hifi.ok) {
+      desc.textContent = '這台裝置的瀏覽器不支援（需要能使用繪圖晶片的新版 Chrome 或 Edge；iPhone 和 iPad 需要 iOS 26 以上的 Safari，較舊的機型可能無法使用）。';
+      ctl.replaceChildren(); size.hidden = true; return;
+    }
+    size.hidden = false;
+    size.replaceChildren(
+      seg([{ v: 'large', label: `最準 ${HiFi.SIZE_MB.large} MB` }, { v: 'small', label: `輕量 ${HiFi.SIZE_MB.small} MB` }], HiFi.pickSize(), pick),
+      h('span', { class: 'muted small' }, HiFi.pickSize() === 'large' ? '講很快又有噪音時最準；手機和記憶體較少的平板請選輕量' : '比較省記憶體，適合手機和平板；講很快又有噪音時會比「最準」多一些錯字'));
+    afterRender();
+    if (proReady().stt) { desc.textContent = '你已經接上 Soniox，上課會用 Soniox 辨識。'; ctl.replaceChildren(); size.hidden = true; return; }
+    if (hifi.has) {
+      desc.textContent = '教授離得遠、有風扇聲、講得快或含糊時，比瀏覽器內建辨識準很多。字幕大約晚半分鐘出現，聲音不會離開這台裝置。';
+      ctl.replaceChildren(
+        switchEl(Store.get('hifi', true), v => { Store.set('hifi', v); }, '高準確字幕'),
+        h('button', { class: 'btn sm ghost', title: '刪除下載的辨識模型，釋放空間', onclick: async () => { await HiFi.forget(); hifi.has = false; paint(); toast('已移除辨識模型', { icon: 'trash-2' }); } }, '移除'));
+      return;
+    }
+    desc.textContent = `瀏覽器內建辨識是為近距離口述設計的，隔著教室會漏掉大部分內容。下載辨識模型（約 ${mb} MB，只需要一次，建議用 Wi-Fi）之後，就能在這台裝置上聽寫。`;
+    const b = h('button', { class: 'btn sm primary', onclick: async () => {
+      b.disabled = true; b.textContent = '準備中…';
+      try {
+        const prog = (a, t) => { b.textContent = `下載中 ${Math.round(a / 1e6)} / ${Math.round(t / 1e6)} MB`; };
+        await HiFi.load(prog);
+        // Some browsers cannot keep the bigger model: it would have to be downloaded again before every class. Use the one that stays.
+        if (!(await HiFi.downloaded()) && HiFi.pickSize() === 'large') {
+          Store.set('hifiSize', 'small'); HiFi.setSize('small');
+          toast('這個瀏覽器存不下「最準」的模型，改下載「輕量」版', { icon: 'info', ms: 6000 });
+          await HiFi.load(prog);
+        }
+        hifi.has = await HiFi.downloaded();
+        if (!hifi.has) throw new Error('瀏覽器沒有把模型存下來（可能是空間不足或無痕模式）');
+        Store.set('hifi', true);
+        if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});   // ask the browser not to clear it when space runs low
+        toast('高準確字幕已經準備好，下次錄音就會使用', { icon: 'check', ms: 5000 });
+      } catch (e) { console.error(e); toast('下載沒有完成：' + ((e && e.message) || e), { icon: 'info', ms: 7000 }); }
+      paint();
+    } }, '下載');
+    ctl.replaceChildren(b);
+  };
+  paint();
+  HiFi.capability().then(c => { if (!c.ok && hifi.ok) { hifi.ok = false; } paint(); });
+  return el;
+}
 function localAIRow() {
   const desc = h('span', null, '檢查中…');
   const ctl = h('div', null);
@@ -3771,7 +4036,7 @@ applyAppearance();
 renderJellyBlobs();
 renderDoodles();
 setupRefraction();
-window.__lectureNotes = { mindMapPDF, mindMapPage, polishTranscript, Cloud, Account, DB, state, Recorder, outlinePDF, BrowserSTT, MicCapture, LocalAI, render, buildFreeNotes, player, renderPlayer, bloom, calendarSheet, notesDocHTML, shareSheet, speechVocab };
+window.__lectureNotes = { importAudioFile, HiFi, hifi, splitCaption, relistenLecture, mindMapPDF, mindMapPage, polishTranscript, Cloud, Account, DB, state, Recorder, outlinePDF, BrowserSTT, MicCapture, LocalAI, render, buildFreeNotes, player, renderPlayer, bloom, calendarSheet, notesDocHTML, shareSheet, speechVocab };
 // Launch animation lives in index.html so it shows on the very first frame; take it away once it has played.
 const splash = document.getElementById('splash');
 const splashMs = splash && getComputedStyle(splash).display !== 'none' && motionOn() ? 2050 : 0;

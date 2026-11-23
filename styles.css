@@ -1632,3 +1632,22 @@ h1, h2, h3, .brand, .on-head h4, .fa-title, .in-text h1, .in-text h2, .acct-top 
 dialog h3 { font-size: 1.3rem; }
 .fa-title { font-size: 1.04rem; }
 .in-text h1 { -webkit-text-stroke: 0; }
+
+/* ---------- v22: high-accuracy captions ---------- */
+.hifi-ctl { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+@media (max-width: 560px) { .hifi-ctl { flex-direction: column; align-items: flex-end; } }
+.hifi-size { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-top: 8px; }
+.hifi-size[hidden] { display: none; }
+
+/* ---------- update notices ---------- */
+.upd-btn { position: relative; }
+.upd-dot { position: absolute; top: 7px; right: 7px; width: 9px; height: 9px; border-radius: 50%; background: #ef4444; box-shadow: 0 0 0 2px var(--bg); display: none; }
+.upd-btn.has .upd-dot { display: block; }
+.upd-list { display: grid; gap: 12px; margin-top: 14px; }
+.upd { border: 1px solid var(--line); border-radius: 16px; padding: 14px 16px; background: var(--surface-2, transparent); }
+.upd.new { border-color: var(--accent); }
+.upd-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2); }
+.upd-ver { padding: 1px 9px; border-radius: 999px; border: 1px solid var(--line); font-weight: 700; }
+.upd-new { padding: 1px 8px; border-radius: 999px; background: #ef4444; color: #fff; font-weight: 700; font-size: 12px; }
+.upd h4 { margin: 8px 0 6px; font-size: 16px; }
+.upd ul { margin: 0; padding-left: 1.2em; display: grid; gap: 5px; font-size: 14px; color: var(--text-2); }

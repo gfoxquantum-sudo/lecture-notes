@@ -62,7 +62,7 @@ const isBlob = v => typeof Blob !== 'undefined' && v instanceof Blob;
 export function pack(lec) {
   const { audioParts, ...rest } = lec;
   rest.hasAudio = !!(audioParts && audioParts.length) || !!lec.hasAudio;
-  return JSON.stringify(rest, (k, v) => (isBlob(v) || k === '_pend' ? undefined : v));
+  return JSON.stringify(rest, (k, v) => (isBlob(v) || k === '_pend' || k === 'oldSegments' ? undefined : v));
 }
 // A lecture from the cloud, keeping the audio and handout files this device already has.
 export function unpack(json, local, u) {
